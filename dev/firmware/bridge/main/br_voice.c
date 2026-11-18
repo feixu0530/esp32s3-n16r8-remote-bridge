@@ -47,6 +47,7 @@ static bool s_enabled = true;   /* PC 端的「语音通道」开关 */
 static voice_hotkey_t s_pressed_hotkey;
 static bool s_hotkey_down;
 static uint32_t s_pressed_at = 0;   /* 热键按下的时刻（ms），看门狗用 */
+static volatile uint32_t s_last_audio_ms = 0;  /* 最近一帧语音的时间（ms） */
 static portMUX_TYPE s_hotkey_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool save_hotkey(const voice_hotkey_t *hotkey)
@@ -98,13 +99,21 @@ static void voice_hotkey_release(void)
 }
 
 /*
- * ★ 语音热键看门狗 ★
+ * ★ 语音热键看门狗（只处理「异常」，不限制正常说话时长）★
  *
- *   热键的抬起只等 ATVV 的 AUDIO_STOP 帧 —— 遥控器不发这一帧，
- *   左Win 就一直按在 PC 上：PC 自己的键盘整个废掉（每个键都变成 Win+某键）。
- *   超时强制释放。
+ *   语音是「按住说话」：输入法要热键一直按着才收音。
+ *   所以只要遥控器还在送音频，热键就必须一直按着 ——
+ *   以前 2 秒就强制松开，说长句直接被截断（用户实测）。
+ *
+ *   这里只在下面三种异常时释放：
+ *     1) 流开着，但连续 3 秒没有音频 → 遥控器停了却没发 AUDIO_STOP
+ *     2) 热键按着，但根本没进入流状态 → 1.5 秒后放掉
+ *     3) 极端兜底：按了 10 分钟还没结束
+ *   正常结束时由 AUDIO_STOP 释放，与说话时长无关。
  */
-#define BR_VOICE_HOTKEY_MAX_MS 2000
+#define BR_VOICE_STREAM_IDLE_MS      3000u
+#define BR_VOICE_NO_STREAM_GRACE_MS  1500u
+#define BR_VOICE_ABSOLUTE_MAX_MS     600000u   /* 10 分钟硬上限 */
 
 void br_voice_watchdog(void)
 {
@@ -118,8 +127,29 @@ void br_voice_watchdog(void)
         return;
     }
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if ((now - at) > BR_VOICE_HOTKEY_MAX_MS) {
-        ESP_LOGW(TAG, "语音热键超时未抬起，强制释放");
+
+    if ((now - at) > BR_VOICE_ABSOLUTE_MAX_MS) {
+        ESP_LOGW(TAG, "语音热键按住超过 10 分钟，兜底释放");
+        voice_hotkey_release();
+        s_streaming = false;
+        s_last_audio_ms = 0;
+        return;
+    }
+
+    if (s_streaming) {
+        uint32_t last = s_last_audio_ms ? s_last_audio_ms : at;
+        if ((now - last) > BR_VOICE_STREAM_IDLE_MS) {
+            ESP_LOGW(TAG, "语音流 %u ms 没有音频，视为结束并释放热键",
+                     (unsigned)BR_VOICE_STREAM_IDLE_MS);
+            voice_hotkey_release();
+            s_streaming = false;
+            s_last_audio_ms = 0;
+        }
+        return;      /* 还在收音 → 绝不释放 */
+    }
+
+    if ((now - at) > BR_VOICE_NO_STREAM_GRACE_MS) {
+        ESP_LOGW(TAG, "热键按着但没有语音流，释放");
         voice_hotkey_release();
     }
 }
@@ -253,6 +283,17 @@ bool br_voice_get_hotkey(uint8_t *modifier, uint8_t *keys, uint8_t *count)
     return true;
 }
 
+void br_voice_on_disconnect(void)
+{
+    if (s_hotkey_down) {
+        ESP_LOGW(TAG, "链路断开，释放语音热键");
+        voice_hotkey_release();
+    }
+    s_streaming = false;
+    s_last_audio_ms = 0;
+    s_pending_len = 0;
+}
+
 void br_voice_set_enabled(bool on)
 {
     s_enabled = on;
@@ -293,6 +334,7 @@ bool br_voice_control(const uint8_t *data, size_t len)
         reset_decoder();
         pressed = voice_hotkey_press();
         s_streaming = true;
+        s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
         ESP_LOGI(TAG, "AUDIO_START reason=%u codec=%u session=%u frame=%u",
                  len > 1 ? data[1] : 0, len > 2 ? data[2] : 0,
                  len > 3 ? data[3] : 0, s_frame_size);
@@ -300,6 +342,7 @@ bool br_voice_control(const uint8_t *data, size_t len)
     case 0x00: /* AUDIO_STOP */
         voice_hotkey_release();
         s_streaming = false;
+        s_last_audio_ms = 0;
         s_pending_len = 0;
         ESP_LOGI(TAG, "AUDIO_STOP reason=%u", len > 1 ? data[1] : 0);
         break;
@@ -321,6 +364,7 @@ bool br_voice_control(const uint8_t *data, size_t len)
 void br_voice_audio(const uint8_t *data, size_t len)
 {
     if (!s_streaming || !data || !len || s_frame_size == 0) return;
+    s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (!s_decoder_synced) reset_decoder();
     for (size_t i = 0; i < len; i++) {
         s_pending[s_pending_len++] = data[i];

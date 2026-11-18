@@ -2143,6 +2143,9 @@ static int conn_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT: {
         s_connect_in_progress = false;
+        /* ★ 断链必须放掉语音热键 ★
+           否则 Ctrl+Win 会一直按在 PC 上，整台电脑的键盘都变成快捷键。 */
+        br_voice_on_disconnect();
         int idx = find_peer_by_conn(event->disconnect.conn.conn_handle);
         if (idx >= 0) {
             s_peers[idx].connected = false;

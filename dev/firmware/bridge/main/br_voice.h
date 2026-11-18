@@ -36,4 +36,6 @@ bool br_voice_enabled(void);
  * 主循环周期调用。
  */
 void br_voice_watchdog(void);
+/** 链路断开：把可能还按着的语音热键放掉 */
+void br_voice_on_disconnect(void);
 

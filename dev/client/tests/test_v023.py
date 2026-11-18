@@ -76,8 +76,17 @@ def test_voice_hotkey_timeout() -> None:
     voice = (FW_MAIN / "br_voice.c").read_text(encoding="utf-8")
     check("语音热键有超时释放函数",
           "br_voice_watchdog" in voice, "")
-    check("语音热键有超时常量",
-          "BR_VOICE_HOTKEY_MAX_MS" in voice, "")
+    # ★ 语义已改：不在「说话时长」上设限，只在异常时兜底 ★
+    check("热键不因说话时长被强制释放",
+          "BR_VOICE_HOTKEY_MAX_MS" not in voice, "")
+    check("流空闲 3 秒才兜底释放",
+          "BR_VOICE_STREAM_IDLE_MS" in voice and "3000u" in voice, "")
+    check("没进入流时 1.5 秒兜底",
+          "BR_VOICE_NO_STREAM_GRACE_MS" in voice, "")
+    check("有 10 分钟硬上限",
+          "BR_VOICE_ABSOLUTE_MAX_MS" in voice and "600000u" in voice, "")
+    check("断链会释放热键",
+          "br_voice_on_disconnect" in voice, "")
     hdr = (FW_MAIN / "br_voice.h").read_text(encoding="utf-8")
     check("头文件里有声明",
           "br_voice_watchdog" in hdr, "")

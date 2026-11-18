@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.pyo
 *.spec
 
 # 本地/构建产物
@@ -16,3 +17,7 @@ dev/firmware/bridge/build/
 dev/firmware/bridge/managed_components/
 dev/firmware/bridge/components/
 dev/firmware/bridge/dependencies.lock
+
+# 二进制资源由 *.b64 + tools/restore_assets.py 还原
+dev/client/src/assets/icons/app.ico
+dev/client/src/assets/remotes/Chromecast-remote-photo.png

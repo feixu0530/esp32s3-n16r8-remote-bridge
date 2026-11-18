@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+# �?目标芯片必须�?project() 之前设定 —�?#   只在 sdkconfig.defaults 里写 CONFIG_IDF_TARGET 不够�?#   CMake 会在�?sdkconfig 之前就决定用哪套工具链（否则会去�?xtensa-esp32s3-elf-gcc）�?set(IDF_TARGET esp32s3)
+set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/components")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(remote_bridge)

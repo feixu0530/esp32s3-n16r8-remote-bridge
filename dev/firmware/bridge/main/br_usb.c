@@ -363,6 +363,17 @@ static uint8_t s_kbd_modifier = 0;  /* 当前按着的修饰键位图 */
  *   ★ 板子绝不可能把 PC 的键盘按死 ★
  */
 #define BR_HID_HOLD_MAX_MS 3000
+/*
+ * ★ 例外：语音热键允许长按 ★
+ *   「按住说话」要按住几十秒 —— 3 秒的卡键保护会把它当成卡住的键，
+ *   每 3 秒清一次 Ctrl+Win，输入法录到一半就断（用户实测 3~4 秒被切断）。
+ */
+static volatile bool s_hold_exempt = false;
+
+void bridge_usb_set_hold_exempt(bool on)
+{
+    s_hold_exempt = on;
+}
 
 static uint32_t s_kbd_stamp[6];     /* 每个普通键的按下时刻（ms） */
 static uint32_t s_mod_stamp[8];     /* 每个修饰键位的按下时刻（ms） */
@@ -678,6 +689,9 @@ void bridge_usb_hid_watchdog(void)
             s_report_pending = false;
             ESP_LOGW(TAG, "补发之前发不出去的 HID 报告");
         }
+    }
+    if (s_hold_exempt) {
+        return;      /* 语音热键按着的时候不判「按住超时」 */
     }
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     bool changed = false;

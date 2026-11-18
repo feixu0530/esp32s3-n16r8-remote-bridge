@@ -41,6 +41,8 @@ void bridge_usb_release_keyboard(uint8_t modifier, const uint8_t *keys, uint8_t 
  *   —— PC 自己的键盘就废了。主循环每 200 ms 调一次。
  */
 void bridge_usb_hid_watchdog(void);
+/** 语音热键按住期间豁免 3 秒卡键保护 */
+void bridge_usb_set_hold_exempt(bool on);
 
 /** 输出消费者控制键（16 位 usage） */
 void bridge_usb_send_consumer(uint16_t usage);

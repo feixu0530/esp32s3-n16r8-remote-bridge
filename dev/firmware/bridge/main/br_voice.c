@@ -78,6 +78,8 @@ static bool voice_hotkey_press(void)
     s_hotkey_down = true;
     s_pressed_at = (uint32_t)(esp_timer_get_time() / 1000);
     portEXIT_CRITICAL(&s_hotkey_mux);
+    /* 语音热键是「按住说话」，要豁免 HID 的 3 秒卡键保护 */
+    bridge_usb_set_hold_exempt(true);
     bridge_usb_press_keyboard(s_pressed_hotkey.modifier,
                               s_pressed_hotkey.keys,
                               s_pressed_hotkey.count);
@@ -96,6 +98,7 @@ static void voice_hotkey_release(void)
     s_hotkey_down = false;
     portEXIT_CRITICAL(&s_hotkey_mux);
     bridge_usb_release_keyboard(pressed.modifier, pressed.keys, pressed.count);
+    bridge_usb_set_hold_exempt(false);
 }
 
 /*

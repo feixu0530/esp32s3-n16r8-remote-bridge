@@ -160,11 +160,21 @@ static size_t led_encode_cb(const void *data, size_t data_size,
     return written;
 }
 
+/* ★ 整体亮度 ★
+ *   WS2812 满亮度很刺眼（尤其夜里），统一压到 55%：
+ *   所有状态（按键蓝、语音粉、呼吸、配对闪）都按这个比例走，
+ *   改一处即可全局调暗。 */
+#define LED_BRIGHTNESS_NUM 38
+#define LED_BRIGHTNESS_DEN 100
+
 void bridge_led_raw(uint8_t r, uint8_t g, uint8_t b)
 {
     if (!s_ready) {
         return;
     }
+    r = (uint8_t)((uint16_t)r * LED_BRIGHTNESS_NUM / LED_BRIGHTNESS_DEN);
+    g = (uint8_t)((uint16_t)g * LED_BRIGHTNESS_NUM / LED_BRIGHTNESS_DEN);
+    b = (uint8_t)((uint16_t)b * LED_BRIGHTNESS_NUM / LED_BRIGHTNESS_DEN);
     /* WS2812 数据顺序 GRB（标准） */
     uint8_t bytes[3] = { g, r, b };
     rmt_transmit_config_t tc = {
@@ -222,12 +232,20 @@ void bridge_led_key_up(void)
     bridge_led_raw(0, 0, 0);
 }
 
+void bridge_led_voice_off(void)
+{
+    if (s_mode == LED_MODE_VOICE) {
+        s_mode = LED_MODE_OFF;
+        bridge_led_raw(0, 0, 0);
+    }
+}
+
 void bridge_led_voice_active(void)
 {
     s_last_voice_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (s_mode != LED_MODE_VOICE) {
         s_mode = LED_MODE_VOICE;
-        bridge_led_raw(150, 0, 0);
+        bridge_led_raw(220, 70, 140);   /* 粉色：语音收音中 */
     }
 }
 

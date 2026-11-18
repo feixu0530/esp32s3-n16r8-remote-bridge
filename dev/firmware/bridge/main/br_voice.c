@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "br_usb.h"
+#include "br_led.h"
 
 static const char *TAG = "br_voice";
 #define ATVV_DEFAULT_FRAME_SIZE 120
@@ -80,6 +81,8 @@ static bool voice_hotkey_press(void)
     portEXIT_CRITICAL(&s_hotkey_mux);
     /* 语音热键是「按住说话」，要豁免 HID 的 3 秒卡键保护 */
     bridge_usb_set_hold_exempt(true);
+    /* 语音期间灯常亮（红色），松开才灭 —— 用户判断「正在收音」的第一反馈 */
+    bridge_led_voice_active();
     bridge_usb_press_keyboard(s_pressed_hotkey.modifier,
                               s_pressed_hotkey.keys,
                               s_pressed_hotkey.count);
@@ -99,6 +102,7 @@ static void voice_hotkey_release(void)
     portEXIT_CRITICAL(&s_hotkey_mux);
     bridge_usb_release_keyboard(pressed.modifier, pressed.keys, pressed.count);
     bridge_usb_set_hold_exempt(false);
+    bridge_led_voice_off();
 }
 
 /*
@@ -129,6 +133,7 @@ void br_voice_watchdog(void)
     if (!down) {
         return;
     }
+    bridge_led_voice_active();   /* 按住期间续期，灯不会因 800ms 空闲超时熄灭 */
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
     if ((now - at) > BR_VOICE_ABSOLUTE_MAX_MS) {

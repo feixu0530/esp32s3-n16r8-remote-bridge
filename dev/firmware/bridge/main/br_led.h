@@ -47,6 +47,8 @@ void bridge_led_set_pairing(bool on);
 
 /** 语音通道有数据 */
 void bridge_led_voice_active(void);
+/** 语音结束：把语音灯关掉（只关语音模式） */
+void bridge_led_voice_off(void);
 
 /** 语音通道静默（仍在传输但没新帧） */
 void bridge_led_voice_idle(void);

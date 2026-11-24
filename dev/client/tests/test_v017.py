@@ -256,14 +256,14 @@ def test_firmware_peer_slot_release() -> None:
     main_src = (FW_MAIN / "app_main.c").read_text(encoding="utf-8")
     check("固件有 VOICE 命令",
           'strcmp(verb, "VOICE")' in main_src, "")
-    check("固件版本号是 1.0.0",
-          '#define FW_VERSION "1.0.0"' in main_src, "")
+    check("固件版本号是 1.2.3",
+          '#define FW_VERSION "2.0.0"' in main_src, "")
 
 
 def test_client_version() -> None:
     """客户端版本号。"""
     from core import version
-    check("客户端版本 1.0.0", version.VERSION == "1.0.0", version.VERSION)
+    check("客户端版本 1.2.3", version.VERSION == "2.0.0", version.VERSION)
 
 
 def main() -> int:

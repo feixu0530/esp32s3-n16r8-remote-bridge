@@ -29,6 +29,29 @@ if IS_WINDOWS:
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+    # ★ 句柄必须声明成 64 位 ★
+    #   ctypes 默认把返回值当 32 位 int（restype=c_int），
+    #   GetClipboardData / GlobalLock 返回的 HANDLE 在 64 位 Windows 上
+    #   被截断成一半 —— GlobalLock 拿着残缺指针去读，直接
+    #   "access violation reading 0x00000000xxxxxxxx"。
+    #   实测：客户端收到手机文本后注入必崩（文本永远打不出来）。
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.CloseClipboard.restype = ctypes.c_bool
+    user32.CloseClipboard.argtypes = []
+    user32.EmptyClipboard.restype = ctypes.c_bool
+    user32.EmptyClipboard.argtypes = []
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
 
 # ================================================================== 串口
 
@@ -372,8 +395,60 @@ class HotkeyRecorderWin(HotkeyRecorder):
 
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
+_KEYEVENTF_EXTENDEDKEY = 0x0001
 _INPUT_KEYBOARD = 1
 _INPUT_MOUSE = 0
+
+
+# ---------------------------------------------------------------- SendInput
+#
+# ★ INPUT 联合体必须放全三种成员 ★
+#   SendInput 会校验 cbSize：只放 KEYBDINPUT 的话，64 位下 sizeof(INPUT)=32，
+#   而系统要求 40（联合体按最大的 MOUSEINPUT 算）—— 直接返回 0，
+#   GetLastError = 87（ERROR_INVALID_PARAMETER），**一个键都发不出去**。
+#   以前文字注入（语音识别结果上屏）就是这么静默失败的。
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD)]
+
+
+class _INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT),
+                    ("hi", _HARDWAREINPUT)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+
+def send_vk(vk: int, extended: bool = False, up: bool = False) -> bool:
+    """按一个虚拟键。返回是否真的发出去了。"""
+    if not IS_WINDOWS:
+        return False
+    flags = 0
+    if extended:
+        flags |= _KEYEVENTF_EXTENDEDKEY
+    if up:
+        flags |= _KEYEVENTF_KEYUP
+    inp = _INPUT(type=_INPUT_KEYBOARD)
+    inp.ki = _KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0,
+                          dwExtraInfo=None)
+    user32.SendInput.restype = wintypes.UINT
+    return user32.SendInput(1, ctypes.byref(inp),
+                             ctypes.sizeof(_INPUT)) == 1
+
 
 # token -> (VK, 扩展位)
 _TOKEN_VK = {
@@ -453,41 +528,25 @@ class TextInjectorWin(TextInjector):
 
     # -- SendInput --
     def _send_vk(self, vk: int, extended: bool, up: bool = False) -> bool:
-        class KEYBDINPUT(ctypes.Structure):
-            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
-
-        class INPUT(ctypes.Structure):
-            class _U(ctypes.Union):
-                _fields_ = [("ki", KEYBDINPUT)]
-            _anonymous_ = ("u",)
-            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
-
-        flags = 0
-        if extended:
-            flags |= 0x0001
-        if up:
-            flags |= _KEYEVENTF_KEYUP
-        inp = INPUT(type=_INPUT_KEYBOARD)
-        inp.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0,
-                            dwExtraInfo=None)
-        user32.SendInput.restype = wintypes.UINT
-        return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
+        return send_vk(vk, extended, up)
 
     def inject_text(self, text: str) -> bool:
         if not text:
             return False
-        self._orig_clip = self._clip_get()
+        # ① 首选剪贴板 + Ctrl+V（中文/emoji 都靠它）
         try:
+            self._orig_clip = self._clip_get()
             self._clip_set(text)
-            # Ctrl+V
+            # 等剪贴板真正被别人拿走再恢复，太快会跟目标程序抢
             self._send_vk(0x11, False, False)   # lctrl down
             self._send_vk(0x56, False, False)   # v down
             self._send_vk(0x56, False, True)    # v up
             self._send_vk(0x11, False, True)    # lctrl up
-            time.sleep(0.05)
+            time.sleep(0.12)
             return True
+        except Exception:
+            # 剪贴板被别的程序锁着 / 句柄异常 —— 退回逐字符 Unicode 输入
+            pass
         finally:
             if self._orig_clip is not None:
                 try:
@@ -495,6 +554,31 @@ class TextInjectorWin(TextInjector):
                 except Exception:
                     pass
                 self._orig_clip = None
+        # ② 兜底：SendInput KEYEVENTF_UNICODE，完全不碰剪贴板
+        try:
+            return self._type_unicode(text)
+        except Exception:
+            return False
+
+    def _type_unicode(self, text: str) -> bool:
+        """逐字符发 Unicode 键事件（KEYEVENTF_UNICODE）。"""
+        if not IS_WINDOWS:
+            return False
+        KEYEVENTF_UNICODE = 0x0004
+        KEYEVENTF_KEYUP = 0x0002
+        ok = True
+        for ch in text:
+            code = ord(ch)
+            for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+                inp = _INPUT(type=_INPUT_KEYBOARD)
+                inp.ki = _KEYBDINPUT(wVk=0, wScan=code, dwFlags=flags,
+                                     time=0, dwExtraInfo=None)
+                user32.SendInput.restype = wintypes.UINT
+                if user32.SendInput(1, ctypes.byref(inp),
+                                    ctypes.sizeof(_INPUT)) != 1:
+                    ok = False
+            time.sleep(0.002)
+        return ok
 
     def send_keys(self, tokens: Iterable[str]) -> bool:
         ok = True
@@ -682,6 +766,30 @@ def open_uri(uri: str) -> bool:
         return True
     except Exception:
         return False
+
+
+_MEDIA_VK = {
+    "vol_up": 0xAF, "vol_down": 0xAE, "mute": 0xAD,
+    "play_pause": 0xB3, "media_stop": 0xB2, "media_next": 0xB0,
+    "media_prev": 0xB1,
+}
+
+
+def send_media_key(name: str) -> bool:
+    """发一个媒体键（音量/静音/播放）。
+
+    ★ 手机键盘页那排功能键走的就是这条路 ★
+      板子把「音量+」这类动作当 sys_action 上报给 PC，
+      PC 端以前只认 open_url，其它一律「暂不支持」——
+      表现就是键盘最上面那排键按了毫无反应。
+
+    这些键都在扩展键区，必须带 KEYEVENTF_EXTENDEDKEY 才生效。
+    """
+    vk = _MEDIA_VK.get(name)
+    if vk is None:
+        return False
+    ok = send_vk(vk, extended=True, up=False)
+    return send_vk(vk, extended=True, up=True) and ok
 
 
 def launch_command(command: "list[str]") -> None:

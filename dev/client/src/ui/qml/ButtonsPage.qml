@@ -41,12 +41,27 @@ Item {
     // ======================================================== 布局常量
     readonly property real mappingCardGap: 2
     readonly property real mappingBoardGap: 6
-    readonly property real mappingPhotoColumnWidth: 114
+    readonly property bool phoneMode: Bridge.remoteKind === "phone"
+    readonly property int ckCellW: 58
+    readonly property int ckCellH: 58
+    readonly property int ckHeaderH: 54
+    readonly property int ckFooterH: 44
+    readonly property int ckPadX: 4
+    readonly property int ckRows: {
+        const list = Bridge.customKeys
+        let n = 0
+        for (let i = 0; i < list.length; i++)
+            n = Math.max(n, Number(list[i].row) || 0)
+        return Math.max(4, n + 1)
+    }
+    readonly property int ckCanvasW: 3 * ckCellW + 2 * ckPadX
+    readonly property int ckCanvasH: ckHeaderH + ckRows * ckCellH + ckFooterH
+    readonly property real mappingPhotoColumnWidth: phoneMode ? 200 : 114
     readonly property int mappingCardColumnWidth: Math.floor(
         (mappingList.width - mappingPhotoColumnWidth - mappingBoardGap * 2) / 2)
     readonly property real mappingKeyLabelWidth: 56
-    readonly property int leftCardRows: 7
-    readonly property int rightCardRows: 8
+    readonly property int leftCardRows: 64
+    readonly property int rightCardRows: 64
     readonly property int remoteButtonCount: Bridge.buttonList.length
 
     property bool connectorRepaintQueued: false
@@ -310,6 +325,13 @@ Item {
     }
 
     // ======================================================== 名称
+    /* 自定义键用后端下发的名字（ck1 这种内部 id 不该露给用户） */
+    function cardDisplayName(row) {
+        if (row && String(row.button_id).indexOf("ck") === 0)
+            return row.button_name
+        return root.shortButtonName(row.button_id)
+    }
+
     function shortButtonName(buttonId) {
         const names = {
             "power": "电源", "up": "上", "left": "左", "back": "返回",
@@ -1309,6 +1331,101 @@ Item {
         }
     }
 
+    // ======================================================== 自定义键删除
+    Dialog {
+        id: customKeyDeleteDialog
+        objectName: "customKeyDeleteDialog"
+        property string buttonId: ""
+        property string field: ""
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 320
+        background: Rectangle {
+            radius: root.tokens.cornerRadiusLarge
+            color: root.tokens.surface
+            border.color: root.tokens.border
+            border.width: root.tokens.hairlineWidth
+        }
+        header: Item { height: 0 }
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingSmall
+            Text {
+                text: qsTr("删除「%1」？对应的按键映射也会一起清掉。").arg(customKeyDeleteDialog.field)
+                color: root.tokens.textPrimary
+                wrapMode: Text.Wrap
+                Layout.fillWidth: true
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                CompactButton {
+                    tokens: root.tokens
+                    text: qsTr("取消")
+                    onClicked: customKeyDeleteDialog.close()
+                }
+                CompactButton {
+                    tokens: root.tokens
+                    text: qsTr("删除")
+                    highlighted: true
+                    onClicked: {
+                        Bridge.removeCustomKey(customKeyDeleteDialog.buttonId)
+                        customKeyDeleteDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
+    // ======================================================== 自定义键改名
+    Dialog {
+        id: customKeyDialog
+        objectName: "customKeyDialog"
+        property string buttonId: ""
+        property alias field: customKeyField
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 320
+        onOpened: customKeyField.forceActiveFocus()
+        background: Rectangle {
+            radius: root.tokens.cornerRadiusLarge
+            color: root.tokens.surface
+            border.color: root.tokens.border
+            border.width: root.tokens.hairlineWidth
+        }
+        header: Item { height: 0 }
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingSmall
+            Text {
+                text: qsTr("快捷键名称（最多 12 个字）")
+                color: root.tokens.textSecondary
+            }
+            CompactTextField {
+                id: customKeyField
+                tokens: root.tokens
+                Layout.fillWidth: true
+                maximumLength: 12
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                CompactButton {
+                    tokens: root.tokens
+                    text: qsTr("取消")
+                    onClicked: customKeyDialog.close()
+                }
+                CompactButton {
+                    tokens: root.tokens
+                    text: qsTr("保存")
+                    highlighted: true
+                    onClicked: {
+                        Bridge.renameCustomKey(customKeyDialog.buttonId, customKeyField.text)
+                        customKeyDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
     // ======================================================== 打开录入弹窗
     function openShortcutRecorder(buttonId, trigger) {
         shortcutRecorder.buttonId = buttonId
@@ -1463,7 +1580,7 @@ Item {
                             Layout.row: modelData.visual_row
                             Layout.fillWidth: true
                             Layout.preferredHeight: visible ? implicitHeight : 0
-                            buttonName: root.shortButtonName(modelData.button_id)
+                            buttonName: root.cardDisplayName(modelData)
                             keyLabelWidth: root.mappingKeyLabelWidth
                             singleText: modelData.single
                             doubleText: modelData.double
@@ -1480,6 +1597,20 @@ Item {
                             onVisibleChanged: root.scheduleConnectorRepaint()
                             Component.onCompleted: root.scheduleConnectorRepaint()
                             onClicked: root.openEditor(modelData.button_id)
+                            onRenameRequested: function (cid) {
+                                if (String(cid).indexOf("ck") === 0) {
+                                    customKeyDialog.buttonId = cid
+                                    customKeyDialog.field.text = modelData.button_name
+                                    customKeyDialog.open()
+                                }
+                            }
+                            onDeleteRequested: function (cid) {
+                                if (String(cid).indexOf("ck") === 0) {
+                                    customKeyDeleteDialog.buttonId = cid
+                                    customKeyDeleteDialog.field = modelData.button_name
+                                    customKeyDeleteDialog.open()
+                                }
+                            }
                         }
                     }
                 }
@@ -1487,6 +1618,8 @@ Item {
                 Item {
                     id: photoSidebar
                     objectName: "photoSidebar"
+                    visible: root.phoneMode ? Bridge.phoneShotSource !== ""
+                                           : photoImage.status === Image.Ready
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.verticalCenter: parent.verticalCenter
                     width: root.mappingPhotoColumnWidth
@@ -1508,16 +1641,53 @@ Item {
                          *   实物图比参考项目大一圈，两边卡片被挤窄，
                          *   字就挤在一起、看着不协调。
                          */
-                        width: 86
-                        height: 250
+                        width: root.phoneMode ? root.ckCanvasW : 86
+                        height: root.phoneMode ? root.ckCanvasH : 250
                         onXChanged: root.scheduleConnectorRepaint()
                         onYChanged: root.scheduleConnectorRepaint()
                         onWidthChanged: root.scheduleConnectorRepaint()
                         onHeightChanged: root.scheduleConnectorRepaint()
 
+                        Rectangle {
+                            objectName: "phoneCanvasBg"
+                            anchors.fill: parent
+                            visible: root.phoneMode
+                            radius: 10
+                            color: "#12161c"
+                            border.width: 1
+                            border.color: root.tokens.border
+
+                            Text {
+                                x: 10
+                                y: 12
+                                text: qsTr("快捷键")
+                                color: "#e8ecf1"
+                                font.family: root.tokens.fontFamily
+                                font.pixelSize: 15
+                                font.weight: Font.Medium
+                            }
+                            Text {
+                                x: 10
+                                y: 32
+                                text: qsTr("由电脑端「按键」页管理")
+                                color: "#8a94a0"
+                                font.family: root.tokens.fontFamily
+                                font.pixelSize: 9
+                            }
+                            Text {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                y: parent.height - 30
+                                text: qsTr("点按发送 · 可拖动到其他格")
+                                color: "#6b7480"
+                                font.family: root.tokens.fontFamily
+                                font.pixelSize: 9
+                            }
+                        }
+
                         Image {
                             id: photoImage
                             objectName: "remotePhoto"
+                            visible: !root.phoneMode
                             /*
                              * ★ 照抄参考项目的画法 ★
                              *   - 宽度按原图比例算（453×1443 → 78×250）
@@ -1534,8 +1704,10 @@ Item {
                             asynchronous: true
                             smooth: true
                             mipmap: true
-                            source: Bridge.remoteImageSource(Bridge.currentRemote)
-                            layer.enabled: photoImage.status === Image.Ready
+                            source: root.phoneMode
+                                ? ""
+                                : Bridge.remoteImageSource(Bridge.currentRemote)
+                            layer.enabled: photoImage.status === Image.Ready && !root.phoneMode
                             layer.effect: MultiEffect {
                                 shadowEnabled: true
                                 shadowColor: root.tokens.remotePhotoShadowColor
@@ -1554,7 +1726,7 @@ Item {
                             objectName: "photoMissingHint"
                             anchors.centerIn: parent
                             width: parent.width
-                            visible: photoImage.status !== Image.Ready
+                            visible: !root.phoneMode && photoImage.status !== Image.Ready
                             tokens: root.tokens
                             kind: noteKind
                             text: qsTr("实物图缺失")
@@ -1576,24 +1748,62 @@ Item {
 
                                 // ★ 热点按 paintedWidth / paintedHeight 定位 ★
                                 //   图是 PreserveAspectFit 摆的，控件宽高 ≠ 图的宽高
-                                width: modelData.width * photoImage.paintedWidth
-                                height: modelData.height * photoImage.paintedHeight
-                                x: photoImage.x
-                                    + (photoImage.width - photoImage.paintedWidth) / 2
-                                    + modelData.x * photoImage.paintedWidth
-                                    - width / 2
-                                y: photoImage.y
-                                    + (photoImage.height - photoImage.paintedHeight) / 2
-                                    + modelData.y * photoImage.paintedHeight
-                                    - height / 2
-                                visible: modelData.hasHotspot
-                                    && photoImage.status === Image.Ready
+                                property real dragDX: 0
+                                property real dragDY: 0
+
+                                readonly property bool isCk: modelData.custom === true
+
+                                width: isCk ? 48 : modelData.width * photoImage.paintedWidth
+                                height: isCk ? 48 : modelData.height * photoImage.paintedHeight
+                                x: (isCk
+                                    ? root.ckPadX + modelData.col * root.ckCellW
+                                      + (root.ckCellW - 48) / 2
+                                    : photoImage.x
+                                      + (photoImage.width - photoImage.paintedWidth) / 2
+                                      + modelData.x * photoImage.paintedWidth
+                                      - width / 2) + dragDX
+                                y: (isCk
+                                    ? root.ckHeaderH + modelData.row * root.ckCellH
+                                      + (root.ckCellH - 48) / 2
+                                    : photoImage.y
+                                      + (photoImage.height - photoImage.paintedHeight) / 2
+                                      + modelData.y * photoImage.paintedHeight
+                                      - height / 2) + dragDY
+                                visible: isCk
+                                    || (modelData.hasHotspot && photoImage.status === Image.Ready)
                                 z: 2
                                 onXChanged: root.scheduleConnectorRepaint()
                                 onYChanged: root.scheduleConnectorRepaint()
                                 onWidthChanged: root.scheduleConnectorRepaint()
                                 onVisibleChanged: root.scheduleConnectorRepaint()
                                 Component.onCompleted: root.scheduleConnectorRepaint()
+
+                                /* 手机自定义键：在截图格点上画一个按钮块（选中高亮） */
+                                Rectangle {
+                                    objectName: "photoHotspotBox_" + photoHotspot.buttonId
+                                    anchors.fill: parent
+                                    visible: modelData.custom === true
+                                    radius: 6
+                                    color: Qt.rgba(0, 0, 0, 0.42)
+                                    border.width: photoHotspot.isSelected ? 2 : 1
+                                    border.color: photoHotspot.isSelected
+                                        ? root.tokens.accent
+                                        : Qt.rgba(1, 1, 1, 0.35)
+                                    Text {
+                                        anchors.fill: parent
+                                        anchors.margins: 2
+                                        text: modelData.name
+                                        color: "#ffffff"
+                                        font.pixelSize: 8
+                                        font.family: root.tokens.fontFamily
+                                        horizontalAlignment: Text.AlignHCenter
+                                        verticalAlignment: Text.AlignVCenter
+                                        wrapMode: Text.Wrap
+                                        elide: Text.ElideRight
+                                        maximumLineCount: 2
+                                        clip: true
+                                    }
+                                }
 
                                 Rectangle {
                                     objectName: "photoHotspotMarker_" + photoHotspot.buttonId
@@ -1615,6 +1825,36 @@ Item {
 
                                 TapHandler {
                                     onTapped: root.openEditor(photoHotspot.buttonId)
+                                }
+
+                                /* 手机自定义键：拖到别的格子（吸附），目标格有键就交换 */
+                                DragHandler {
+                                    id: hotspotDrag
+                                    target: null
+                                    enabled: photoHotspot.modelData.custom === true
+                                    property real baseX: 0
+                                    property real baseY: 0
+                                    onActiveChanged: {
+                                        if (active) {
+                                            baseX = photoHotspot.dragDX
+                                            baseY = photoHotspot.dragDY
+                                        } else {
+                                            const cx = photoHotspot.x + photoHotspot.width / 2
+                                            const cy = photoHotspot.y + photoHotspot.height / 2
+                                            const norm = root.hotspotCellOf(cx, cy)
+                                            photoHotspot.dragDX = 0
+                                            photoHotspot.dragDY = 0
+                                            if (norm)
+                                                Bridge.moveCustomKey(photoHotspot.buttonId,
+                                                                     norm.col, norm.row)
+                                        }
+                                    }
+                                    onTranslationChanged: {
+                                        if (!active)
+                                            return
+                                        photoHotspot.dragDX = baseX + translation.x
+                                        photoHotspot.dragDY = baseY + translation.y
+                                    }
                                 }
                                 HoverHandler { id: hotspotHover }
                                 Rectangle {
@@ -1674,7 +1914,7 @@ Item {
                             Layout.row: modelData.visual_row
                             Layout.fillWidth: true
                             Layout.preferredHeight: visible ? implicitHeight : 0
-                            buttonName: root.shortButtonName(modelData.button_id)
+                            buttonName: root.cardDisplayName(modelData)
                             keyLabelWidth: root.mappingKeyLabelWidth
                             singleText: modelData.single
                             doubleText: modelData.double
@@ -1691,6 +1931,20 @@ Item {
                             onVisibleChanged: root.scheduleConnectorRepaint()
                             Component.onCompleted: root.scheduleConnectorRepaint()
                             onClicked: root.openEditor(modelData.button_id)
+                            onRenameRequested: function (cid) {
+                                if (String(cid).indexOf("ck") === 0) {
+                                    customKeyDialog.buttonId = cid
+                                    customKeyDialog.field.text = modelData.button_name
+                                    customKeyDialog.open()
+                                }
+                            }
+                            onDeleteRequested: function (cid) {
+                                if (String(cid).indexOf("ck") === 0) {
+                                    customKeyDeleteDialog.buttonId = cid
+                                    customKeyDeleteDialog.field = modelData.button_name
+                                    customKeyDeleteDialog.open()
+                                }
+                            }
                         }
                     }
                 }
@@ -1741,6 +1995,14 @@ Item {
                         elide: Text.ElideRight
                     }
                     Item { Layout.fillWidth: true }
+                    CompactButton {
+                        objectName: "customKeyAddButtonBottom"
+                        tokens: root.tokens
+                        visible: root.phoneMode
+                        compactMinimumWidth: root.tokens.buttonWidth6Chars
+                        text: qsTr("＋ 添加快捷键")
+                        onClicked: Bridge.addCustomKey()
+                    }
                     CompactButton {
                         id: customAppsButton
                         objectName: "customAppsButton"
@@ -1793,6 +2055,30 @@ Item {
      * 热点坐标和 buttonList 按 button_id 对齐，
      * 保证卡片列和热点列的下标一一对应（画线时靠下标配对）。
      */
+    /* 屏幕坐标 → 自定义键格点（和 controller 的 CUSTOM_AREA/3×4 保持一致） */
+    function hotspotCellOf(itemX, itemY) {
+        if (root.phoneMode) {
+            const col = Math.floor((itemX - root.ckPadX) / root.ckCellW)
+            const row = Math.floor((itemY - root.ckHeaderH) / root.ckCellH)
+            if (col < 0 || col > 2 || row < 0 || row >= root.ckRows)
+                return null
+            return { col: col, row: row }
+        }
+        const p = photoImage
+        if (!p || p.paintedWidth <= 0 || p.paintedHeight <= 0)
+            return null
+        const baseX = p.x + (p.width - p.paintedWidth) / 2
+        const baseY = p.y + (p.height - p.paintedHeight) / 2
+        const nx = (itemX - baseX) / p.paintedWidth
+        const ny = (itemY - baseY) / p.paintedHeight
+        const x0 = 0.06, x1 = 0.94, y0 = 0.30, y1 = 0.86
+        const col = Math.floor((nx - x0) / ((x1 - x0) / 3))
+        const row = Math.floor((ny - y0) / ((y1 - y0) / 4))
+        if (col < 0 || col > 2 || row < 0 || row > 3)
+            return null
+        return { col: col, row: row }
+    }
+
     readonly property var hotspotRows: {
         const buttons = Bridge.buttonList
         const spots = Bridge.hotspots
@@ -1808,6 +2094,11 @@ Item {
             }
             out.push({
                 button_id: b.button_id,
+                name: b.button_name,
+                custom: found ? found.custom === true : false,
+                col: found && found.col !== undefined ? found.col : 0,
+                row: found && found.row !== undefined ? found.row : 0,
+                rows: found && found.rows !== undefined ? found.rows : 4,
                 hasHotspot: found !== null,
                 x: found ? found.x : 0,
                 y: found ? found.y : 0,

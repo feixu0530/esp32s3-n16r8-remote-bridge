@@ -87,6 +87,12 @@ else:
 try:
     # esptool v5 的 flash 选项必须放在 write-flash **之后**
     cmd = [ESPTOOL, "--chip", "esp32s3", "-b", "460800", "-p", PORT,
+           # ★ 刷完不要立刻硬复位 ★（--after 是**全局**选项，放在子命令前面）
+           #   以前是默认的 hard-reset：固件还没起来 USB 就重新枚举，
+           #   Windows 抓到半枚举的设备 → 弹「无法识别的 USB 设备」
+           #   （还会在设备管理器里留一条未连接的旧实例，刷一次多一条）。
+           #   现在先不复位，等 USB 干净注销后自己发复位脉冲。
+           "--after", "no-reset",
            "write-flash",
            "--flash-mode", "dio", "--flash-freq", "80m", "--flash-size", "16MB"]
     for offset, path in FLASH_ARGS:
@@ -105,6 +111,29 @@ try:
     print("=" * 66)
     if proc.returncode == 0:
         print("烧录成功！")
+        # ★ 干净复位 ★
+        #   等 1.5 秒让 Windows 把 USB 设备干净注销，
+        #   再发一次复位脉冲 —— 这样重新枚举的是**完整**的复合设备，
+        #   不会再弹「无法识别的 USB 设备」。
+        print("等 USB 干净断开…")
+        time.sleep(1.5)
+        try:
+            s = serial.Serial(PORT, 115200, timeout=0.2)
+            s.dtr = False; s.rts = False; time.sleep(0.15)
+            s.dtr = True;  s.rts = True;  time.sleep(0.08)
+            s.dtr = False; s.rts = False
+            s.close()
+            print("已复位，等板子重新枚举…")
+        except Exception as exc:
+            print(f"（复位脉冲失败，请手动拔插一次：{exc}）")
+        # 板子复位 → USB 重新枚举 → Windows 会留下一条「未连接的旧实例」。
+        # 顺手清一下（没管理员权限就只提示，不影响刷写）。
+        try:
+            import subprocess as _sp
+            _sp.run([sys.executable, os.path.join(PROJECT, "cleanup_stale_devices.py")],
+                     timeout=180)
+        except Exception as _exc:
+            print(f"（清理旧设备实例失败，忽略：{_exc}）")
     else:
         print(f"烧录失败，返回码 {proc.returncode}")
         # ★ 给明确的下一步指引 ★

@@ -327,7 +327,7 @@ def test_voice_names_and_logs() -> None:
 def test_detect_and_model_defaults() -> None:
     """检测保持状态、型号默认模板、界面清理。"""
     ctl = (CLIENT / "src" / "core" / "controller.py").read_text(encoding="utf-8")
-    det = ctl.split("def _detect_key")[1][:1200]
+    det = ctl.split("def _detect_key")[1][:2400]
     check("检测真实按键不再自动退出",
           "_learn_active = False" not in det, "")
     check("检测到键后仍提示继续",
@@ -369,7 +369,11 @@ def test_app_title() -> None:
 def test_flash_safety() -> None:
     """刷写：不整片擦除、线程兜异常、失败退回外部 esptool。"""
     ctl = (CLIENT / "src" / "core" / "controller.py").read_text(encoding="utf-8")
-    run = ctl.split("def run() -> None:")[1][:1500]
+    # controller 里现在有多个 run()（推映射/推自定义键/刷写），
+    # 必须挑「刷写」那个来检查
+    _parts = ctl.split("def run() -> None:")
+    run = next(p_ for p_ in _parts[1:]
+               if "刷写线程必须兜住异常" in p_[:600])[:1500]
     check("刷写不再先整片擦除", "erase_flash" not in ctl, "")
     check("刷写线程兜住异常", "except Exception as exc:" in run and
           "刷写异常" in run, "")

@@ -133,6 +133,19 @@ def test_connection_gate(ctl: BridgeController) -> None:
 
 def test_buttons_page_gate(ctl: BridgeController) -> None:
     print("\n[按键页数据闸门]")
+    # ★ 把选中项定死 ★
+    #   板子现在还会报「手机（临时遥控器）」，按键页跟着选中项变。
+    #   这条闸门考的是**谷歌遥控器那套固定档案**，不能「测成板子上恰好配了什么」。
+    ctl._cfg["remotes"] = [{
+        "addr": "AA:BB:CC:DD:EE:FF",
+        "type": 0,
+        "name": "Test Remote",
+        "image": "",
+        "markers": [],
+        "bindings": {},
+    }]
+    ctl.selectRemote(0)
+
     rows = ctl.buttonList
     check("按键页有 15 行（固定档案，不是标记驱动）",
           len(rows) == 15, f"rows={len(rows)}")
@@ -158,6 +171,89 @@ def test_buttons_page_gate(ctl: BridgeController) -> None:
     check("档案表与固件的 usage 表一致",
           remote_layout.CHROMECAST_CONSUMER_USAGES.get("home") == 0x0223,
           str(remote_layout.CHROMECAST_CONSUMER_USAGES.get("home")))
+
+
+def test_phone_layout_gate(ctl: BridgeController) -> None:
+    """
+    手机（临时遥控器）那套布局。
+
+    ★ 为什么单独考 ★
+      手机是「像遥控器一样的移动端」，但它不是 BLE 遥控器：
+      没有实物图、没有上/下/左/右，键位空间也与遥控器隔离。
+      这些都是「两套布局不能串」的硬约束，串了就出诡异 bug。
+    """
+    print("\n[手机端布局闸门]")
+    ctl._cfg["remotes"] = [{
+        "addr": "50:50:50:50:50:50",
+        "type": 0,
+        "name": "手机（临时遥控器）",
+        "image": "",
+        "markers": [],
+        "kind": "phone",
+        "bindings": {},
+    }]
+    ctl.selectRemote(0)
+
+    rows = ctl.buttonList
+    check("手机按键页只列自定义键（默认 0 行）",
+          len(rows) == 0, f"rows={len(rows)}")
+    check("手机每个键都有 key_id",
+          all(r["key_id"] for r in rows),
+          str([r["key_id"] for r in rows]))
+    check("手机 key_id 前缀是 6（与遥控器的 2 隔离）",
+          all(r["key_id"].startswith("6:") for r in rows),
+          str([r["key_id"] for r in rows]))
+    check("手机没有实物图热点",
+          len(ctl.hotspots) == 0, f"hotspots={len(ctl.hotspots)}")
+    check("手机与遥控器 key_id 不重合",
+          not ({r["key_id"] for r in rows}
+               & {"2:%d" % u for u in
+                  remote_layout.CHROMECAST_CONSUMER_USAGES.values()}))
+
+
+def test_phone_first_select_gate(ctl: BridgeController) -> None:
+    """首屏：_current=-1 时自动选中手机，按键行必须跟着重建（不能留谷歌键）。"""
+    print("")
+    print("[首屏选中闸门]")
+    ctl._cfg["remotes"] = [{
+        "addr": "50:50:50:50:50:50",
+        "type": 0,
+        "name": "手机（临时遥控器）",
+        "image": "",
+        "markers": [],
+        "kind": "phone",
+        "bindings": {"bindings": {}, "secondary_bindings": {}},
+        "custom_keys": [
+            {"id": 1, "name": "切换任务", "col": 0, "row": 0},
+            {"id": 2, "name": "截图", "col": 2, "row": 1},
+        ],
+    }]
+    ctl._current = -1
+    ctl._rebuild_remote_model()
+    ctl._ensure_current_remote()
+    rows = ctl.buttonList
+    check("首屏自动选中手机后按键行已重建",
+          len(rows) == 2 and all(r["button_id"].startswith("ck") for r in rows),
+          str([r["button_id"] for r in rows]))
+
+
+def test_phone_many_keys_gate(ctl: BridgeController) -> None:
+    """27 个自定义键：左右卡片不能落在同一行（会互相遮住）。"""
+    print("")
+    print("[手机多键分行闸门]")
+    keys = [{"id": i, "name": "键 %d" % i,
+             "col": (i - 1) % 3, "row": (i - 1) // 3} for i in range(1, 28)]
+    ctl._cfg["remotes"] = [{
+        "addr": "50:50:50:50:50:50", "type": 0, "name": "手机",
+        "image": "", "markers": [], "kind": "phone",
+        "bindings": {"bindings": {}, "secondary_bindings": {}},
+        "custom_keys": keys,
+    }]
+    ctl.selectRemote(0)
+    rows = ctl.buttonList
+    pairs = [(r["side"], r["visual_row"]) for r in rows]
+    check("27 个键全部进了卡片列表", len(rows) == 27, f"rows={len(rows)}")
+    check("同侧没有重复行号", len(pairs) == len(set(pairs)), str(sorted(pairs)))
 
 
 def test_mapping_writeback_gate(ctl: BridgeController) -> None:
@@ -256,6 +352,9 @@ def main() -> int:
     try:
         test_connection_gate(ctl)
         test_buttons_page_gate(ctl)
+        test_phone_layout_gate(ctl)
+        test_phone_first_select_gate(ctl)
+        test_phone_many_keys_gate(ctl)
         test_mapping_writeback_gate(ctl)
     finally:
         # 收尾：停掉协议线程和 QTimer，别让 Qt 在解释器退出时炸

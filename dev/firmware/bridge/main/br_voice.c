@@ -4,6 +4,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -27,6 +28,35 @@ static const int s_step_table[89] = {
 static const int8_t s_index_table[8] = {-1,-1,-1,-1,2,4,6,8};
 
 static RingbufHandle_t s_pcm_rb;
+/*
+ * 手机语音的 PCM 缓冲（与 ATVV 分开）。
+ *
+ * ★ 必须分开 ★
+ *   UAC1 端点只有一路 PCM。两路混在一个缓冲里 → 音频交织 → 撕裂/爆音。
+ *   分开之后由 s_phone_active 决定 audio_tx_task 从哪个缓冲取。
+ */
+static RingbufHandle_t s_phone_rb;
+static volatile bool s_phone_active;
+/*
+ * ★ voice_start 之前先到的 PCM（两个 HTTP 请求并发，谁先到不定）★
+ *
+ * ★ 为什么只有 4 KB ★
+ *   这是 .bss，吃的是板子那 512KB 内部 RAM —— 而内部 RAM 正处于紧张状态：
+ *   协议任务（cdc，8KB 栈）就是因为内存不够**创建不出来**，
+ *   结果 PC 端发什么命令板子都不回（表现为「读不到固件版本」）。
+ *   以前这里占 16KB，现在手机语音走 ADPCM（一包才 1600 字节），
+ *   而且页面是**先发 voice_start 再发音频**，预卷几乎用不上 —— 4KB 足够。
+ */
+#define PHONE_PREROLL_BYTES 4096
+static uint8_t s_preroll[PHONE_PREROLL_BYTES];
+static size_t s_preroll_len;
+/*
+ * ★ 预卷缓冲必须加锁 ★
+ *   HTTP 会话任务是并发的（最多 8 个 socket），
+ *   两个 PCM 请求同时进来就会同时改 s_preroll / s_preroll_len ——
+ *   数据竞争 + memcpy 重叠 → 内存踩坏，板子直接死机（现象：突然 ping 不通）。
+ */
+static SemaphoreHandle_t s_preroll_lock;
 static uint16_t s_frame_size = ATVV_DEFAULT_FRAME_SIZE;
 static uint8_t s_pending[ATVV_MAX_FRAME_SIZE];
 static uint16_t s_pending_len;
@@ -119,6 +149,8 @@ static void voice_hotkey_release(void)
  *   正常结束时由 AUDIO_STOP 释放，与说话时长无关。
  */
 #define BR_VOICE_STREAM_IDLE_MS      3000u
+/* 手机语音走 WiFi + HTTP，包与包之间可能有秒级空档，判定要宽松 */
+#define BR_VOICE_PHONE_IDLE_MS      10000u
 #define BR_VOICE_NO_STREAM_GRACE_MS  1500u
 #define BR_VOICE_ABSOLUTE_MAX_MS     600000u   /* 10 分钟硬上限 */
 
@@ -140,17 +172,30 @@ void br_voice_watchdog(void)
         ESP_LOGW(TAG, "语音热键按住超过 10 分钟，兜底释放");
         voice_hotkey_release();
         s_streaming = false;
+        s_phone_active = false;
         s_last_audio_ms = 0;
         return;
     }
 
     if (s_streaming) {
         uint32_t last = s_last_audio_ms ? s_last_audio_ms : at;
-        if ((now - last) > BR_VOICE_STREAM_IDLE_MS) {
+        /*
+         * ★ 手机路径的空闲判定要宽松得多 ★
+         *   遥控器（ATVV/BLE）的音频是连续不断流，3 秒没音频就是它停了。
+         *   手机走的是 WiFi + HTTP：每个 PCM 包都要等 TCP 把最后一段送到
+         *   （实测单包 250ms~5s），WiFi 一抖动就可能空档好几秒 ——
+         *   用同一个 3 秒判定会把会话直接掐掉，语音永远起不来。
+         *   手机路径给 10 秒，遥控器路径保持 3 秒。
+         */
+        uint32_t idle_limit = s_phone_active ? BR_VOICE_PHONE_IDLE_MS
+                                              : BR_VOICE_STREAM_IDLE_MS;
+        if ((now - last) > idle_limit) {
             ESP_LOGW(TAG, "语音流 %u ms 没有音频，视为结束并释放热键",
-                     (unsigned)BR_VOICE_STREAM_IDLE_MS);
+                     (unsigned)idle_limit);
             voice_hotkey_release();
             s_streaming = false;
+            /* 手机语音也要一起停 —— 否则会一直占着 UAC 端点不供给 ATVV */
+            s_phone_active = false;
             s_last_audio_ms = 0;
         }
         return;      /* 还在收音 → 绝不释放 */
@@ -233,6 +278,11 @@ esp_err_t br_voice_init(void)
 {
     if (!s_pcm_rb) s_pcm_rb = xRingbufferCreate(PCM_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
     if (!s_pcm_rb) return ESP_ERR_NO_MEM;
+    /* 预卷缓冲的锁（HTTP 会话任务是并发的） */
+    if (!s_preroll_lock) {
+        s_preroll_lock = xSemaphoreCreateMutex();
+        if (!s_preroll_lock) return ESP_ERR_NO_MEM;
+    }
     reset_decoder();
     s_streaming = false;
     nvs_handle_t nvs;
@@ -385,17 +435,203 @@ void br_voice_audio(const uint8_t *data, size_t len)
 
 size_t br_voice_read_pcm(void *dst, size_t max_bytes)
 {
-    if (!s_pcm_rb || !dst || !max_bytes) return 0;
+    RingbufHandle_t rb = s_phone_active ? s_phone_rb : s_pcm_rb;
     size_t got = 0;
-    void *item = xRingbufferReceiveUpTo(s_pcm_rb, &got, 0, max_bytes);
+    void *item;
+
+    if (!rb || !dst || !max_bytes) return 0;
+    item = xRingbufferReceiveUpTo(rb, &got, 0, max_bytes);
     if (!item) return 0;
     memcpy(dst, item, got);
-    vRingbufferReturnItem(s_pcm_rb, item);
+    vRingbufferReturnItem(rb, item);
     return got;
 }
 
 bool br_voice_streaming(void)
 {
-    return s_streaming;
+    return s_streaming || s_phone_active;
+}
+
+/* ------------------------------------------------------------ 手机语音 */
+
+void br_voice_phone_start(void)
+{
+    if (s_phone_active) {
+        return;
+    }
+    if (!s_phone_rb) {
+        s_phone_rb = xRingbufferCreate(PCM_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
+        if (!s_phone_rb) {
+            ESP_LOGE(TAG, "手机语音缓冲分配失败");
+            return;
+        }
+    }
+    /* 清掉上一次的残留 */
+    {
+        size_t n = 0;
+        void *item;
+        while ((item = xRingbufferReceiveUpTo(s_phone_rb, &n, 0, PCM_RING_BYTES)) != NULL) {
+            vRingbufferReturnItem(s_phone_rb, item);
+        }
+    }
+
+    /*
+     * ★ 仲裁：手机是主动方，ATVV 让位 ★
+     *   手机按住说话时如果遥控器也在收音，两路会交织 → 撕裂。
+     *   这里让 ATVV 停掉。
+     */
+    if (s_streaming) {
+        s_streaming = false;
+        clear_pcm();
+        ESP_LOGI(TAG, "手机语音开始，ATVV 语音让位");
+    }
+
+    s_phone_active = true;
+    s_streaming = true;
+    s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    /* 补上 voice_start 之前先到的那段，别把开头半句话丢了 */
+    if (s_preroll_lock) {
+        xSemaphoreTake(s_preroll_lock, portMAX_DELAY);
+    }
+    if (s_preroll_len && s_phone_rb) {
+        xRingbufferSend(s_phone_rb, s_preroll, s_preroll_len, 0);
+        ESP_LOGI(TAG, "补进预卷音频 %u 字节", (unsigned)s_preroll_len);
+        s_preroll_len = 0;
+    }
+    if (s_preroll_lock) {
+        xSemaphoreGive(s_preroll_lock);
+    }
+    voice_hotkey_press();
+    ESP_LOGI(TAG, "手机语音开始（热键已按下，等待 PC 输入法收音）");
+}
+
+void br_voice_phone_end(void)
+{
+    if (!s_phone_active) {
+        return;
+    }
+    s_phone_active = false;
+    s_streaming = false;
+    s_last_audio_ms = 0;
+    voice_hotkey_release();
+    ESP_LOGI(TAG, "手机语音结束");
+}
+
+void br_voice_push_phone_pcm(const uint8_t *pcm, size_t len)
+{
+    static uint32_t s_total;
+    static uint32_t s_last_log;
+    if (!s_phone_active) {
+        /*
+         * ★ voice_start 还没到就先存着 ★
+         *   voice_start 与 PCM 是两个并发的 HTTP 请求，板子不一定先处理
+         *   voice_start —— PCM 先到就会被扔掉，开头那半句话就没了。
+         *   这里留一段预卷，voice_start 到了再补进缓冲。
+         */
+        if (pcm && len) {
+            if (s_preroll_lock) {
+                xSemaphoreTake(s_preroll_lock, portMAX_DELAY);
+            }
+            if (len >= sizeof(s_preroll)) {
+                memcpy(s_preroll, pcm, sizeof(s_preroll));
+                s_preroll_len = sizeof(s_preroll);
+            } else {
+                if (s_preroll_len + len > sizeof(s_preroll)) {
+                    size_t drop = s_preroll_len + len - sizeof(s_preroll);
+                    memmove(s_preroll, s_preroll + drop,
+                            s_preroll_len - drop);
+                    s_preroll_len -= drop;
+                }
+                memcpy(s_preroll + s_preroll_len, pcm, len);
+                s_preroll_len += len;
+            }
+            if (s_preroll_lock) {
+                xSemaphoreGive(s_preroll_lock);
+            }
+        }
+        return;
+    }
+    if (!pcm || !len || !s_phone_rb) {
+        return;
+    }
+    s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    /* 缓冲满了就丢弃这一段 —— 宁可丢音频，也不能阻塞 WiFi 收包的线程 */
+    xRingbufferSend(s_phone_rb, pcm, len, 0);
+
+    /* ★ 取证：每秒一行累计字节与峰值 ★ */
+    s_total += (uint32_t)len;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (now - s_last_log > 1000) {
+        s_last_log = now;
+        int32_t peak = 0;
+        for (size_t i = 0; i < len; i += 2) {
+            int16_t v = (int16_t)((uint16_t)pcm[i] | ((uint16_t)pcm[i + 1] << 8));
+            if (v < 0) v = -v;
+            if (v > peak) peak = v;
+        }
+        ESP_LOGI(TAG, "手机PCM 累计 %u 字节 峰值 %d", (unsigned)s_total, (int)peak);
+    }
+}
+
+/* ------------------------------------------------------------ 手机 ADPCM */
+
+/*
+ * ★ 手机语音和遥控器语音走同一套 ADPCM 解码 ★
+ *   步长表/索引表就是上面 ATVV 用的那两张（标准 IMA ADPCM，4bit/样本）。
+ *   手机端在页面里用同一套算法编码，板子这边解码后送进同一条 UAC 麦克风端点 ——
+ *   所以手机和遥控器在 PC 那边是**一模一样**的麦克风输入。
+ *
+ *   为什么非要压成 ADPCM：
+ *   手机 → 板子走 WiFi，实测一次请求固定开销 ~90ms、带宽 ~15KB/s。
+ *   16kHz 裸 PCM 要 32KB/s，这条链路送不到实时（音频只剩一半）。
+ *   ADPCM 压 4 倍（8KB/s）才有实时余量。
+ */
+static int32_t s_pad_pred;      /* 手机 ADPCM 解码器状态（预测值） */
+static int s_pad_idx;           /* 手机 ADPCM 解码器状态（步长索引） */
+
+static int16_t pad_decode_nibble(uint8_t nibble)
+{
+    int step = s_step_table[s_pad_idx];
+    int diff = step >> 3;
+    if (nibble & 1) diff += step >> 2;
+    if (nibble & 2) diff += step >> 1;
+    if (nibble & 4) diff += step;
+    s_pad_pred += (nibble & 8) ? -diff : diff;
+    if (s_pad_pred > 32767) s_pad_pred = 32767;
+    if (s_pad_pred < -32768) s_pad_pred = -32768;
+    s_pad_idx += s_index_table[nibble & 7];
+    if (s_pad_idx < 0) s_pad_idx = 0;
+    if (s_pad_idx > 88) s_pad_idx = 88;
+    return (int16_t)s_pad_pred;
+}
+
+void br_voice_push_phone_adpcm(const uint8_t *data, size_t len, bool reset)
+{
+    if (!data || !len) {
+        return;
+    }
+    if (reset) {
+        /* 本次录音的第一包：解码器状态从头对齐（手机端也是新建编码器） */
+        s_pad_pred = 0;
+        s_pad_idx = 0;
+    }
+    /*
+     * 一个 ADPCM 字节 = 两个采样（高半字节在前，和 ATVV 的解码顺序一致）。
+     * 解出来的 PCM 立刻交给手机 PCM 那条路（活跃时进环形缓冲，
+     * 否则进预卷）—— 和裸 PCM 完全同一条通路。
+     */
+    int16_t pcm[128 * 2];
+    size_t n = 0;
+    for (size_t i = 0; i < len; i++) {
+        pcm[n++] = pad_decode_nibble((uint8_t)(data[i] >> 4));
+        pcm[n++] = pad_decode_nibble((uint8_t)(data[i] & 0x0f));
+        if (n >= sizeof(pcm) / sizeof(pcm[0])) {
+            br_voice_push_phone_pcm((const uint8_t *)pcm, n * sizeof(pcm[0]));
+            n = 0;
+        }
+    }
+    if (n) {
+        br_voice_push_phone_pcm((const uint8_t *)pcm, n * sizeof(pcm[0]));
+    }
 }
 

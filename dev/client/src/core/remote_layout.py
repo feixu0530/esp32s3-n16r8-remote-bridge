@@ -30,6 +30,13 @@ from typing import Dict, List, Optional, Tuple
 # ★ 消费者页 source ★
 BR_SRC_CONSUMER = 2
 
+# ★ 手机（移动端）source ★
+# 与固件 br_types.h 的 BR_SRC_PHONE 一一对应 —— 两边必须一致。
+BR_SRC_PHONE = 6
+
+# 手机在映射表里的伪地址（手机没有 BLE 地址）
+BR_PHONE_ADDR = "50:50:50:50:50:50"
+
 
 @dataclass(frozen=True)
 class ButtonHotspot:
@@ -278,3 +285,154 @@ def profile_for_name(name: str) -> Optional[Dict[str, object]]:
             if str(token).lower() in low:
                 return prof
     return None
+
+
+# ------------------------------------------------------------------ 手机布局
+#
+# 手机（movo 触控板页的快捷键区）没有实物遥控器上的「上/下/左/右」，
+# 只有几个语义键。固件 br_types.h 的 BR_PHU_* 就是它们的 usage。
+#
+# ★ 键位空间必须与谷歌遥控器隔离 ★
+#   手机  key_id = "6:<usage>"（source=BR_SRC_PHONE）
+#   遥控器 key_id = "2:<usage>"（source=BR_SRC_CONSUMER）
+#   前缀不同 ⇒ 同一台 PC 上两套映射物理上不可能互相覆盖。
+
+PHONE_BUTTONS: Tuple[Tuple[str, int, str], ...] = (
+    ("esc",         0x01, "退出"),
+    ("play_pause",  0x05, "播放 / 暂停"),
+    ("volume_up",   0x02, "音量+"),
+    ("volume_down", 0x03, "音量-"),
+    ("mute",        0x04, "静音"),
+)
+
+PHONE_BUTTON_ORDER: Tuple[str, ...] = tuple(b[0] for b in PHONE_BUTTONS)
+PHONE_USAGES: Dict[str, int] = {b[0]: b[1] for b in PHONE_BUTTONS}
+PHONE_DISPLAY_NAMES: Dict[str, str] = {b[0]: b[2] for b in PHONE_BUTTONS}
+
+PHONE_SHORT_NAMES: Dict[str, str] = {
+    "esc": "退出",
+    "play_pause": "播放",
+    "volume_up": "音+",
+    "volume_down": "音-",
+    "mute": "静音",
+}
+
+# 手机没有实物图 ⇒ 没有热点；按键卡片按两列排
+PHONE_VISUAL_ROWS: Dict[str, int] = {
+    "esc": 0, "play_pause": 1,
+    "volume_up": 0, "volume_down": 1, "mute": 2,
+}
+
+PHONE_RIGHT_BUTTON_IDS: Tuple[str, ...] = ("volume_up", "volume_down", "mute")
+
+# 出厂默认动作：与固件 br_mapping.c 的 k_binds_phone[] 对齐
+# 旧版「底部快捷键」的 usage：固件里仍保留（6:6），但手机端已改为打开快捷键页。
+PHONE_LEGACY_SHORTCUT_USAGE = 0x06
+
+# ---- 手机「自定义快捷键页」----
+# usage = CUSTOM_KEY_USAGE_BASE + id（id 1..12），与固件 br_types.h 一一对应。
+CUSTOM_KEY_MAX = 64          # 映射表 64 条，扣掉 5 条固定键后仍够用
+CUSTOM_KEY_USAGE_BASE = 0x100
+CUSTOM_COLS = 3
+CUSTOM_ROWS = 64             # 行上限（滚屏展示）
+# 手机截图里触点区的归一化范围（配合 phone-shot.jpg）
+CUSTOM_AREA = {"x0": 0.06, "x1": 0.94, "y0": 0.30, "y1": 0.86}
+
+
+def custom_button_id(kid: int) -> str:
+    return "ck%d" % kid
+
+
+def custom_key_id(kid: int) -> str:
+    return "%d:%d" % (BR_SRC_PHONE, CUSTOM_KEY_USAGE_BASE + kid)
+
+
+def custom_id_of_usage(usage: int) -> int:
+    """usage 落在自定义键区间就返回 id，否则 0。"""
+    kid = usage - CUSTOM_KEY_USAGE_BASE
+    return kid if 1 <= kid <= CUSTOM_KEY_MAX else 0
+
+
+PHONE_DEFAULT_ACTIONS: Dict[str, str] = {
+    "esc": "Escape",
+    "play_pause": "播放 / 暂停",
+    "volume_up": "系统音量 +",
+    "volume_down": "系统音量 −",
+    "mute": "系统静音",
+}
+
+# 所有布局的种类
+LAYOUT_CHROMECAST = "chromecast"
+LAYOUT_PHONE = "phone"
+LAYOUT_KINDS: Tuple[str, ...] = (LAYOUT_CHROMECAST, LAYOUT_PHONE)
+
+
+def layout_kind_for_remote(remote: object) -> str:
+    """一个遥控器条目属于哪套布局。
+
+    配置里没写 kind 的一律当谷歌遥控器 —— 老的配置不能因为加了新类型就失效。
+    """
+    if isinstance(remote, dict) and str(remote.get("kind", "")) == LAYOUT_PHONE:
+        return LAYOUT_PHONE
+    return LAYOUT_CHROMECAST
+
+
+def button_order_for(kind: str) -> Tuple[str, ...]:
+    return PHONE_BUTTON_ORDER if kind == LAYOUT_PHONE else BUTTON_ORDER
+
+
+def display_name_for(kind: str, button_id: str) -> str:
+    if kind == LAYOUT_PHONE:
+        return PHONE_DISPLAY_NAMES.get(button_id, button_id)
+    return display_name(button_id)
+
+
+def short_name_for(kind: str, button_id: str) -> str:
+    if kind == LAYOUT_PHONE:
+        return PHONE_SHORT_NAMES.get(button_id, display_name_for(kind, button_id))
+    return short_name(button_id)
+
+
+def button_key_id_for(kind: str, button_id: str) -> str:
+    """键 → 内部 key_id 字符串（"<source>:<usage十进制>"）。"""
+    if kind == LAYOUT_PHONE:
+        if button_id.startswith("ck"):
+            try:
+                kid = int(button_id[2:])
+            except ValueError:
+                return ""
+            return custom_key_id(kid) if 1 <= kid <= CUSTOM_KEY_MAX else ""
+        usage = PHONE_USAGES.get(button_id)
+        if usage is None:
+            return ""
+        return f"{BR_SRC_PHONE}:{usage}"
+    return button_key_id(button_id)
+
+
+def is_voice_button_for(kind: str, button_id: str) -> bool:
+    # 手机没有语音键（语音走按住说话的通道，不是快捷键）
+    return False if kind == LAYOUT_PHONE else is_voice_button(button_id)
+
+
+def visual_row_for(kind: str, button_id: str) -> int:
+    if kind == LAYOUT_PHONE:
+        return PHONE_VISUAL_ROWS.get(button_id, 0)
+    return visual_row(button_id)
+
+
+def right_button_ids_for(kind: str) -> Tuple[str, ...]:
+    return PHONE_RIGHT_BUTTON_IDS if kind == LAYOUT_PHONE else RIGHT_BUTTON_IDS
+
+
+def usage_to_button_id_for(kind: str) -> Dict[int, str]:
+    """usage → 键 id（给人话日志用）。"""
+    if kind == LAYOUT_PHONE:
+        return {usage: bid for bid, usage in PHONE_USAGES.items()}
+    return usage_to_button_id()
+
+
+def default_actions_for(kind: str) -> Dict[str, str]:
+    if kind == LAYOUT_PHONE:
+        return dict(PHONE_DEFAULT_ACTIONS)
+    return DEFAULT_ACTIONS
+

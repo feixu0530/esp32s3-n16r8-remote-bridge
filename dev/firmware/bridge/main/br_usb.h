@@ -53,6 +53,43 @@ void bridge_usb_press_consumer(uint16_t usage);
 /** 消费者键抬起（发 usage=0 的报告） */
 void bridge_usb_release_consumer(uint16_t usage);
 
+/* -------------------------------------------------------------- 鼠标 */
+
+/** 鼠标按键位掩码 */
+#define BR_MOUSE_LEFT   0x01
+#define BR_MOUSE_RIGHT  0x02
+#define BR_MOUSE_MIDDLE 0x04
+
+/**
+ * 鼠标相对移动（像素增量）。
+ *
+ * 内部会累加到整像素再发 —— 单个 HID 报告的位移字段只有 8 位有符号，
+ * 直接截断会丢位移。
+ */
+void bridge_usb_mouse_move(int32_t dx, int32_t dy);
+
+/** 鼠标滚轮（dy>0 向上滚） */
+void bridge_usb_mouse_scroll(int32_t dy);
+
+/**
+ * 鼠标按键按下。
+ *
+ * 按下前会先清掉「本该没按着却残留」的键（抬起丢了的兜底）。
+ */
+void bridge_usb_press_mouse_button(uint8_t button);
+
+/**
+ * 鼠标按键抬起。
+ *
+ * ★ 只有板子自己按下过才发抬起 ★
+ *   HID 鼠标报告是状态式的，发一个「本来没按着」的抬起，
+ *   系统会当成一次真实的右键抬起，前景窗口直接弹右键菜单。
+ */
+void bridge_usb_release_mouse_button(uint8_t button);
+
+/** 鼠标当前按着的键（诊断用） */
+uint8_t bridge_usb_mouse_buttons(void);
+
 /** 读一行 CDC 输入（阻塞，超时返回 false） */
 bool bridge_usb_read_line(char *buf, size_t cap, uint32_t timeout_ms);
 

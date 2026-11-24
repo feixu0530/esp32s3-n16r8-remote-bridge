@@ -86,6 +86,17 @@ static const char *TAG = "br_usb";
 static const uint8_t s_hid_report_desc[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(1)),
     TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(2)),
+    /*
+     * ★ 鼠标（report id 3）—— 手机触控板用 ★
+     *
+     * 必须与键盘/消费者**共用同一个 HID 接口**（同一个 IN 端点 0x81）：
+     *   ESP32-S3 的 IN 端点只有 EP1..EP4 四个槽，现已全占
+     *   （EP1 HID / EP2 CDC数据 / EP3 CDC通知 / EP4 UAC麦克风）。
+     *   新开一个 HID 接口要 EP5 → 越界 → Windows Code 10 → 整个设备报废。
+     *   Arduino-ESP32 的 USBHID 就是这么做的（一个接口三个 report id），
+     *   Windows 会把键盘/鼠标/消费者三个 top-level collection 都认出来。
+     */
+    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(3)),
 };
 
 static const uint8_t s_config_descriptor[] = {
@@ -320,6 +331,24 @@ static void usb_tx_task(void *arg);
 #define TXQ_LEN 64
 
 static QueueHandle_t s_txq = NULL;
+
+/*
+ * ★ CDC 发送锁 ★
+ *
+ * esp_tinyusb 的 tinyusb_cdcacm_write_queue / write_flush **不是线程安全的**：
+ * 内部直接操作 TinyUSB 的 CDC FIFO 和 IN 端点。
+ *
+ * 原来有两处并发调用：
+ *   - usb_tx_task（每行一次 write+flush）
+ *   - cdc_task 主循环里的 bridge_usb_flush_cdc()
+ * 两边同时动同一个 FIFO 会把 TinyUSB 的状态机弄乱 ——
+ * 实测现象：COM6 上 `tusb_cdc_acm: Flush failed` 以 2 次/秒刷屏，
+ * CDC 再也排不空，主机侧表现为「连上后再也收不到任何应答和事件」，
+ * 手机端打字的 TEXT 也就永远到不了 PC。
+ *
+ * 现在所有 CDC 发送动作都必须先拿到这把锁。
+ */
+static SemaphoreHandle_t s_cdc_lock = NULL;
 
 
 static QueueHandle_t s_cdc_queue = NULL;
@@ -783,6 +812,152 @@ void bridge_usb_release_consumer(uint16_t usage)
     ESP_LOGD(TAG, "consumer release");
 }
 
+/* ---------------------------------------------------------------- 鼠标 */
+
+/*
+ * 鼠标按键位（USB HID 标准）。
+ * bit0=左 bit1=右 bit2=中 bit3=后退 bit4=前进
+ */
+#define BR_MOUSE_LEFT   0x01
+#define BR_MOUSE_RIGHT  0x02
+#define BR_MOUSE_MIDDLE 0x04
+
+/*
+ * ★ 当前按着的鼠标键 ★
+ *
+ * 这是「幽灵右键」的唯一防线。
+ *
+ *   HID 鼠标报告是**状态式**的：报告里写的是「此刻哪些键按着」。
+ *   所以抬起一个**本来就没按着**的键，会发出一份「之前按着的键都松开了」的报告，
+ *   而系统会把这次抬起当成一次真实的右键抬起 —— 前景窗口收到 WM_RBUTTONUP
+ *   就直接弹右键菜单（很多窗口根本不校验 DOWN）。
+ *   movo 服务端为此专门查 GetAsyncKeyState（movo_mouse_service.py:106-152）。
+ *   板子没有 Win32 API 可查，但有更好的办法：
+ *   **只有板子自己按下过，才允许抬起。**
+ */
+static uint8_t s_mouse_buttons = 0;
+
+/** 鼠标移动的待发增量（相对位移累加到整像素再发） */
+static int32_t s_mouse_dx = 0;
+static int32_t s_mouse_dy = 0;
+static int32_t s_mouse_wheel = 0;
+
+static bool send_mouse_report(void)
+{
+    uint8_t buf[5];
+    bool ok;
+
+    buf[0] = s_mouse_buttons;
+    buf[1] = (uint8_t)(int8_t)(s_mouse_dx > 127 ? 127 : (s_mouse_dx < -127 ? -127 : s_mouse_dx));
+    buf[2] = (uint8_t)(int8_t)(s_mouse_dy > 127 ? 127 : (s_mouse_dy < -127 ? -127 : s_mouse_dy));
+    buf[3] = (uint8_t)(int8_t)(s_mouse_wheel > 127 ? 127 : (s_mouse_wheel < -127 ? -127 : s_mouse_wheel));
+    buf[4] = 0;   /* pan */
+
+    ok = tud_hid_mouse_report(3, buf[0], (int8_t)buf[1], (int8_t)buf[2],
+                              (int8_t)buf[3], (int8_t)buf[4]);
+    /*
+     * ★ 鼠标也要留证据 ★
+     *   PC 侧看不到「指针有没有动」——真机验收只能看设备侧日志。
+     */
+    ESP_LOGI(TAG, "HIDTX mouse id=3 btn=%02X dx=%d dy=%d wheel=%d ok=%u",
+             buf[0], (int8_t)buf[1], (int8_t)buf[2], (int8_t)buf[3], (unsigned)ok);
+
+    s_mouse_dx = 0;
+    s_mouse_dy = 0;
+    s_mouse_wheel = 0;
+
+    return ok;
+}
+
+/**
+ * 鼠标相对移动。dx/dy 是像素增量。
+ *
+ * 累加到整像素再发：手机触控板一次滑动可能是几十像素，
+ * 而单个 HID 报告的位移字段只有 8 位有符号（-127..127），
+ * 直接截断会丢位移 —— 表现为「滑动幅度越大丢得越多」。
+ */
+void bridge_usb_mouse_move(int32_t dx, int32_t dy)
+{
+    if (!tud_hid_ready()) {
+        return;
+    }
+    s_mouse_dx += dx;
+    s_mouse_dy += dy;
+    if (s_mouse_dx == 0 && s_mouse_dy == 0) {
+        return;
+    }
+    if (!send_mouse_report()) {
+        ESP_LOGW(TAG, "HID 鼠标移动报告发送失败");
+    }
+}
+
+/** 鼠标滚轮。dy>0 向上滚。 */
+void bridge_usb_mouse_scroll(int32_t dy)
+{
+    if (!tud_hid_ready()) {
+        return;
+    }
+    s_mouse_wheel += dy;
+    if (s_mouse_wheel == 0) {
+        return;
+    }
+    if (!send_mouse_report()) {
+        ESP_LOGW(TAG, "HID 鼠标滚轮报告发送失败");
+    }
+}
+
+/**
+ * 鼠标按键按下。
+ *
+ * 按下前先确保状态干净：如果该键**没按着**却残留着，
+ * 说明上一次抬起丢了 —— 先补一次抬起再按，避免叠加。
+ */
+void bridge_usb_press_mouse_button(uint8_t button)
+{
+    if (!tud_hid_ready()) {
+        return;
+    }
+    if ((s_mouse_buttons & button) == 0) {
+        /* 该键本来没按着，但状态里有 —— 说明抬起丢了，先清掉再按 */
+        s_mouse_buttons &= (uint8_t)~button;
+    }
+    s_mouse_buttons |= button;
+    if (!send_mouse_report()) {
+        ESP_LOGW(TAG, "HID 鼠标按下报告发送失败");
+    }
+    ESP_LOGD(TAG, "mouse press button=%02X state=%02X", button, s_mouse_buttons);
+}
+
+/**
+ * 鼠标按键抬起。
+ *
+ * ★ 只有板子自己按下过才发抬起 ★
+ *   见上面 s_mouse_buttons 的注释 —— 这一条是「幽灵右键」的唯一防线，
+ *   任何情况下都不能省。
+ */
+void bridge_usb_release_mouse_button(uint8_t button)
+{
+    if ((s_mouse_buttons & button) == 0) {
+        /* 本来就没按着 —— 发了抬起就是一次「幽灵抬起」，会弹出右键菜单 */
+        return;
+    }
+    if (!tud_hid_ready()) {
+        /* USB 暂不可用：状态先记着，等 USB 恢复由看门狗补发 */
+        return;
+    }
+    s_mouse_buttons &= (uint8_t)~button;
+    if (!send_mouse_report()) {
+        ESP_LOGW(TAG, "HID 鼠标抬起报告发送失败");
+    }
+    ESP_LOGD(TAG, "mouse release button=%02X state=%02X", button, s_mouse_buttons);
+}
+
+/** 鼠标当前按着的键（诊断用） */
+uint8_t bridge_usb_mouse_buttons(void)
+{
+    return s_mouse_buttons;
+}
+
 /* ---------------------------------------------------------------- 初始化 */
 
 esp_err_t bridge_usb_init(void)
@@ -801,6 +976,9 @@ esp_err_t bridge_usb_init(void)
     }
 
     /* 发送队列（保证 bridge_usb_write 不阻塞 BLE 回调） */
+    if (!s_cdc_lock) {
+        s_cdc_lock = xSemaphoreCreateMutex();
+    }
     if (!s_txq) {
         s_txq = xQueueCreate(TXQ_LEN, sizeof(char *));
         if (!s_txq) {
@@ -1033,10 +1211,30 @@ static void usb_tx_task(void *arg)
         br_uart_write(buf, strlen(buf));
 
         if (s_cdc_tx_buf && s_cdc_itf != TINYUSB_CDC_ACM_MAX) {
-            size_t wrote = tinyusb_cdcacm_write_queue(s_cdc_itf,
-                                                      (const uint8_t *)buf,
-                                                      strlen(buf));
-            if (wrote == strlen(buf)) {
+            if (s_cdc_lock && xSemaphoreTake(s_cdc_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
+                /* 锁拿不到：另一条路径正在写，这一行下次再说（丢日志不算错） */
+                free(buf);
+                buf = NULL;
+                continue;
+            }
+            /* ★ 处理短写 ★ FIFO 只有 64 字节，长行一次写不完；
+               以前 wrote != 全长就整行丢弃，协议行被截断后客户端解析全乱。
+               这里循环把剩余字节写完（最多等 ~200ms，写不进去就放弃这一行）。 */
+            size_t total = strlen(buf);
+            size_t off = 0;
+            int guard = 0;
+            while (off < total && guard++ < 40) {
+                size_t wrote = tinyusb_cdcacm_write_queue(s_cdc_itf,
+                                                          (const uint8_t *)buf + off,
+                                                          total - off);
+                if (wrote == 0) {
+                    /* 排空一下再试 */
+                    tinyusb_cdcacm_write_flush(s_cdc_itf, 2);
+                    continue;
+                }
+                off += wrote;
+            }
+            if (off == total) {
                 /* 带超时的阻塞冲刷：给 TinyUSB 时间把 FIFO 推给主机。
                  * ★ 5 ticks @ 100Hz = 50ms ★
                  *   以前是 20 ticks = **200ms** —— 一条日志能把发送任务卡住 200ms，
@@ -1056,6 +1254,9 @@ static void usb_tx_task(void *arg)
                 if ((s_dropped & 0x3F) == 0) {
                     ESP_LOGD(TAG, "cdc 队列满，丢掉 %u 条日志", s_dropped);
                 }
+            }
+            if (s_cdc_lock) {
+                xSemaphoreGive(s_cdc_lock);
             }
         }
 
@@ -1080,7 +1281,16 @@ void bridge_usb_flush_cdc(void)
         return;     /* 主机未连接，flush 无意义 */
     }
 
+    /* ★ 必须和 usb_tx_task 互斥 ★
+       拿不到锁说明发送任务正在写 —— 它自己会 flush，这里直接跳过。
+       加锁之前这两条路径并发操作同一个 CDC FIFO，会把 TinyUSB 卡死。 */
+    if (s_cdc_lock && xSemaphoreTake(s_cdc_lock, 0) != pdTRUE) {
+        return;
+    }
     /* 非阻塞冲刷：把 FIFO 里的残留推出去。
      * 不检查返回值：ESP_ERR_NOT_FINISHED 表示"还没完"，下一轮继续。 */
     tinyusb_cdcacm_write_flush(s_cdc_itf, 0);
+    if (s_cdc_lock) {
+        xSemaphoreGive(s_cdc_lock);
+    }
 }

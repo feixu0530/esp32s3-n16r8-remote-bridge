@@ -23,9 +23,26 @@ idf_component_register(SRCS
     "br_led.h"
     "br_uart.c"
     "br_uart.h"
+    "br_json_min.c"
+    "br_json_min.h"
+    "br_phone.c"
+    "br_ckeys.c"
+    "br_ckeys.h"
+    "br_ble_gatt.c"
+    "br_phone.h"
+    "br_wifi.c"
+    "br_wifi.h"
+    "br_web.c"
+    "br_cert.c"
+    "br_cert.h"
+    "br_web.h"
+    "br_web_assets.c"
+    "br_web_assets.h"
     INCLUDE_DIRS "."
     REQUIRES bt nvs_flash esp_timer esp_driver_rmt esp_driver_uart
-             driver esp_common esp_ringbuf esp_tinyusb tinyusb)
+             driver esp_common esp_ringbuf esp_tinyusb tinyusb
+             esp_wifi esp_netif esp_event esp_http_server esp_https_server esp-tls
+             lwip esp_coex)
 
 # The ESP-IDF TinyUSB wrapper exposes CDC/HID Kconfig switches but this
 # project's custom composite descriptor also includes a UAC1 microphone.

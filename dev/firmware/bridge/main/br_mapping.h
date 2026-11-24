@@ -30,6 +30,14 @@ int br_mapping_apply_defaults(const char *addr, const char *name,
                               const char *profile_in, char *out_profile);
 
 /**
+ * 给「手机」铺出厂默认映射。
+ *
+ * 手机不是 BLE 设备，没有广播名可匹配档案，所以单独一个入口。
+ * 返回：>0 铺了几条；0 已配过或没铺成；-1 暂时忙（PC 正在写映射）。
+ */
+int br_mapping_apply_phone_defaults(void);
+
+/**
  * 按遥控器名字找出它该用的默认档案 id（找不到返回 NULL）。
  *
  * ★ 档案 id 会记在板子的配对表里 ★
@@ -37,4 +45,12 @@ int br_mapping_apply_defaults(const char *addr, const char *name,
  */
 const char *br_mapping_profile_id_for_name(const char *name);
 void br_mapping_key(const uint8_t addr[6], uint32_t key_id, bool down);
+
+/**
+ * 这个键配了映射吗（任意触发方式都算）。
+ *
+ * 手机端的快捷键用它判断「用户配过没有」：
+ * 配过走映射表，没配用出厂默认 —— 两边都不失效。
+ */
+bool br_mapping_has_key(const uint8_t addr[6], uint32_t key_id);
 

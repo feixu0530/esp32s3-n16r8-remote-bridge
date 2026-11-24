@@ -154,7 +154,8 @@ def run_checks() -> bool:
                  "tests/test_v021.py",
                  "tests/test_v022.py",
                  "tests/test_v023.py",
-                 "tests/test_v024.py"):
+                 "tests/test_v024.py",
+                 "tests/test_v110_contract.py"):
         print(f"\n  > {test}")
         # ★ encoding 必须写死 utf-8 ★
         #   子进程被我们用 PYTHONIOENCODING 强制成 UTF-8 了，
@@ -432,11 +433,16 @@ def verify(pkg_dir: Path) -> bool:
         #   残留的进程会**占着 COM12** —— 用户拿到手点「连接」没反应
         #   （报 PermissionError 13 拒绝访问）。
         #   ★ 只按 PID 杀自己起的这个，别误伤用户正在用的客户端 ★
+        #   ★ 而且要**无条件**跑一遍 taskkill ★
+        #     PyInstaller 的 onedir 模式还会再起一个 bootloader 子进程，
+        #     父进程退出后子进程照样活着 —— 它的文件锁会让后面压 zip 报
+        #     PermissionError 13（groupbox-icon.png 读不了）。
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True)
+            pass
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
     except Exception as exc:
         check(False, "EXE 启动", str(exc))
 

@@ -16,6 +16,7 @@
  */
 #include "br_led.h"
 #include <string.h>
+#include "esp_timer.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
@@ -61,6 +62,8 @@ static size_t led_encode_cb(const void *data, size_t data_size,
                              rmt_symbol_word_t *symbols, bool *done, void *arg);
 
 static led_mode_t s_mode = LED_MODE_OFF;
+/* 手机（BLE App）在线也算「有链路」—— 否则手机能用时灯还在蓝呼吸 */
+static bool s_phone_linked;
 /* 按键指示的状态机 */
 static bool     s_key_held = false;       /* 键是否仍按住 */
 static uint32_t s_key_press_at = 0;       /* 按下时刻 */
@@ -72,6 +75,10 @@ static uint32_t s_last_voice_ms = 0;
 /* BLE 连接状态：false = 正在找遥控器（呼吸），true = 已连上（等按键） */
 static bool s_connected = false;
 static bool s_pairing = false;   /* 配对窗口开着 → 快闪蓝 */
+static int64_t s_pair_ok_until = 0;  /* 配对成功提示（绿灯快闪） */
+static int64_t s_phone_act_until = 0;   /* 手机输入反馈（青灯亮一小会儿） */
+static uint32_t s_act_count = 0;        /* 累计触发次数（排障用） */
+static int64_t s_phone_act_last = 0;    /* 上次触发时刻（限流用） */
 
 void bridge_led_init(void)
 {
@@ -266,9 +273,19 @@ void bridge_led_set_connected(bool on)
     s_connected = on;
 }
 
+void bridge_led_set_phone_linked(bool on)
+{
+    s_phone_linked = on;
+}
+
 void bridge_led_set_pairing(bool on)
 {
     s_pairing = on;
+}
+
+void bridge_led_pair_ok(void)
+{
+    s_pair_ok_until = (int64_t)(xTaskGetTickCount() * portTICK_PERIOD_MS) + 1500;
 }
 
 void bridge_led_connecting(void)
@@ -282,6 +299,23 @@ void bridge_led_idle(void)
     if (s_mode != LED_MODE_KEY && s_mode != LED_MODE_VOICE) {
         s_mode = LED_MODE_OFF;
     }
+}
+
+uint32_t bridge_led_activity_count(void)
+{
+    return s_act_count;
+}
+
+void bridge_led_phone_activity(void)
+{
+    int64_t now = esp_timer_get_time();
+    /* 60ms 限流：30Hz 的 move 也能变成「常亮」，不会闪成一条 */
+    if (now - s_phone_act_last < 60000) {
+        return;
+    }
+    s_phone_act_last = now;
+    s_phone_act_until = now + 150000;   /* 停手 150ms 后灭 */
+    s_act_count++;
 }
 
 void bridge_led_task(void *arg)
@@ -303,12 +337,20 @@ void bridge_led_task(void *arg)
          *   优先级最高（除了按键本身）——
          *   「未连接」的慢呼吸太温和，用户根本注意不到。
          */
-        if (s_pairing && s_mode != LED_MODE_KEY) {
+        /* 配对成功提示优先：绿灯快闪 1.5 秒 */
+        if (now < (uint32_t)s_pair_ok_until && s_mode != LED_MODE_KEY) {
+            uint32_t phase = now % 200;
+            uint8_t level = (phase < 100) ? 100 : 0;
+            bridge_led_raw(0, level, 0);
+        } else if (esp_timer_get_time() < s_phone_act_until && s_mode != LED_MODE_KEY) {
+            /* 手机有输入：青色（用户指定；比白灯柔和，和配对蓝/成功绿也区分开） */
+            bridge_led_raw(0, 150, 150);
+        } else if (s_pairing && s_mode != LED_MODE_KEY) {
             uint32_t phase = now % 400;
             uint8_t level = (phase < 200) ? 90 : 0;
             bridge_led_raw(0, 0, level);
         } else if (s_mode != LED_MODE_KEY && s_mode != LED_MODE_VOICE) {
-            if (!s_connected) {
+            if (!s_connected && !s_phone_linked) {
                 uint32_t phase = now % 1200;
                 uint8_t level;
                 if (phase < 600) {

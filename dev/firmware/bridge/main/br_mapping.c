@@ -297,6 +297,22 @@ static const br_default_bind_t k_binds_chromecast[] = {
     { 8740u, 2, 1, 0x00, 1, { 0x2A } },     /* 返回 长按 → Backspace（连着删） */
 };
 
+/*
+ * 手机（移动端）的快捷键栏
+ *
+ *   只有触控板页快捷键栏那三个键（esc / 音量+ / 音量-）走映射表 ——
+ *   键盘页敲的字是字面输入，直接发 HID 键盘报告，不进映射表。
+ *
+ * key_id = (BR_SRC_PHONE << 12) | usage，与遥控器的 key_id 空间完全隔离。
+ */
+static const br_default_bind_t k_binds_phone[] = {
+    { BR_KEY_MAKE(BR_SRC_PHONE, BR_PHU_ESC),         0, 1, 0x00, 1, { 0x29 } },  /* Esc → ESC */
+    { BR_KEY_MAKE(BR_SRC_PHONE, BR_PHU_VOLUME_UP),   0, 2, 0x00, 1, { 0xE9 } },  /* 音量+ → 消费者音量+ */
+    { BR_KEY_MAKE(BR_SRC_PHONE, BR_PHU_VOLUME_DOWN), 0, 2, 0x00, 1, { 0xEA } },  /* 音量- → 消费者音量- */
+    { BR_KEY_MAKE(BR_SRC_PHONE, BR_PHU_MUTE),        0, 2, 0x00, 1, { 0xE2 } },  /* 静音 → 消费者静音 */
+    { BR_KEY_MAKE(BR_SRC_PHONE, BR_PHU_PLAY_PAUSE),  0, 2, 0x00, 1, { 0xCD } },  /* 播放 → 消费者播放/暂停 */
+};
+
 static const br_default_profile_t k_default_profiles[] = {
     { "chromecast", "chromecast", "谷歌遥控器", k_binds_chromecast,
       (int)(sizeof(k_binds_chromecast) / sizeof(k_binds_chromecast[0])) },
@@ -419,6 +435,51 @@ int br_mapping_apply_defaults(const char *addr_str, const char *name,
         s_stage_active = false; /* 别把暂存区卡住 */
     }
     ESP_LOGI(TAG, "出厂默认映射已铺好：%s %d 条 ok=%d", prof->label, n, ok ? 1 : 0);
+    return ok ? n : 0;
+}
+
+/**
+ * 给「手机」铺出厂默认映射。
+ *
+ * 手机不是 BLE 设备，没有广播名可匹配档案，所以单独开一个入口。
+ * 用的是同一个暂存区/提交机制，与遥控器共用一套存储与下发路径。
+ *
+ * ★ 用户配过就绝不覆盖 ★（与遥控器同样的规矩）
+ */
+int br_mapping_apply_phone_defaults(void)
+{
+    static const uint8_t phone_addr[6] = BR_PHONE_ADDR;
+    int n = (int)(sizeof(k_binds_phone) / sizeof(k_binds_phone[0]));
+
+    if (br_mapping_count(phone_addr) > 0) {
+        return 0;               /* 用户配过 —— 绝不覆盖 */
+    }
+    if (s_stage_active) {
+        return -1;              /* PC 正在写 —— 等一下再来 */
+    }
+    if (n > BR_MAX_BINDS) {
+        n = BR_MAX_BINDS;
+    }
+    memset(&s_stage, 0, sizeof(s_stage));
+    s_stage.magic = MAP_MAGIC;
+    s_stage.version = MAP_VERSION;
+    s_stage.count = (uint16_t)n;
+    for (int i = 0; i < n; i++) {
+        br_bind_t *b = &s_stage.binds[i];
+        b->key_id = k_binds_phone[i].key_id;
+        b->trig = k_binds_phone[i].trig;
+        b->out = k_binds_phone[i].out;
+        b->mods = k_binds_phone[i].mods;
+        b->nkeys = k_binds_phone[i].nkeys;
+        memcpy(b->keys, k_binds_phone[i].keys, sizeof(b->keys));
+    }
+    memcpy(s_stage_addr, phone_addr, 6);
+    s_stage_active = true;
+    bool ok = br_mapping_commit();
+    if (!ok) {
+        s_stage_active = false;
+    }
+    ESP_LOGI(TAG, "手机出厂默认映射已铺好：%d 条 ok=%d", n, ok ? 1 : 0);
     return ok ? n : 0;
 }
 
@@ -564,6 +625,22 @@ static bool mapping_has_trig(void *ctx, const uint8_t addr[6], uint32_t key_id,
 {
     (void)ctx;
     return find_bind(addr, key_id, trig, NULL);
+}
+
+/**
+ * 这个键配了映射吗（任意触发方式都算）。
+ *
+ * 手机端的快捷键要用它判断「用户配过没有」：
+ * 配过 → 走映射表；没配 → 用出厂默认行为。
+ */
+bool br_mapping_has_key(const uint8_t addr[6], uint32_t key_id)
+{
+    if (!addr) {
+        return false;
+    }
+    return mapping_has_trig(NULL, addr, key_id, BR_TRIG_SINGLE) ||
+           mapping_has_trig(NULL, addr, key_id, BR_TRIG_DOUBLE) ||
+           mapping_has_trig(NULL, addr, key_id, BR_TRIG_LONG);
 }
 
 /** 手势引擎说：这个触发的 press / release 动作，执行它。 */

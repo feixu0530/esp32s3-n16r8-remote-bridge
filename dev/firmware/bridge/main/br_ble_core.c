@@ -27,6 +27,8 @@
 #include "br_usb.h"
 #include "br_voice.h"
 #include "br_led.h"
+#include "br_phone.h"
+#include "br_ble_gatt.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -84,7 +86,9 @@ static const uint8_t k_atvv_ctl_canon[16] = {
 /* ------------------------------------------------------------- 扫描参数 */
 #define SCAN_ROUND_MS      1000    /* 一轮扫描时长 */
 #define SCAN_COOLDOWN_MS   300     /* 扫空后的冷却 —— 遥控器广播窗口很短，必须几乎连续扫 */
-#define CONNECT_SETTLE_MS   120    /* 停扫描到发起连接的间隔 */
+#define CONNECT_SETTLE_MS   400    /* 停扫描到发起连接的间隔 */
+                             /* 100% 占空比的扫描取消更慢，120ms 不够 ——
+                                控制器一直没空执行连接，连接槽就卡死了 */
 /*
  * ★ 连接超时：1500ms ★
  *
@@ -98,6 +102,9 @@ static const uint8_t k_atvv_ctl_canon[16] = {
  * 连不上就早点把射频还给扫描，扫描命中率才是关键。
  */
 #define CONNECT_TIMEOUT_MS 1500
+/* 连接看门狗：比 CONNECT_TIMEOUT_MS 宽裕，
+   免得 NimBLE 正常回报之前就被我们抢走连接槽 */
+#define CONNECT_WATCHDOG_MS 4000
 
 /*
  * ★ 发起连接时本机用哪个地址类型 ★
@@ -235,6 +242,17 @@ static bool s_scanning;
 static bool s_scan_continuous;
 static bool s_scan_session_active = false;
 static bool s_scan_round_done;
+
+/*
+ * ★ 手机正在用板子时的「别扫」窗口 ★
+ *
+ * 单射频：BLE 扫描占空比 37%，跟 WiFi 抢天线 ——
+ * 实测手机滑动触控板时板端每秒刷几十行日志，
+ * HTTP 响应被拖慢，页面就卡得没法用。
+ * 所以手机一有事件就暂停扫描几秒，把射频让给 WiFi。
+ */
+static volatile int64_t s_phone_busy_until;
+static int64_t s_connect_deadline;   /* 连接看门狗：到点还没 CONNECT 就放开 */
 static bool s_connect_in_progress;
 static int64_t s_next_pick = 0;   /* 下次挑目标的时刻 */
 static int64_t s_next_blind = 0;  /* 下次盲连兜底的时刻 */
@@ -243,6 +261,21 @@ static int     s_type_flip = 0;         /* 地址类型逐次交替 */
 static int64_t s_round_done_at;
 
 static bool s_auto;
+
+/*
+ * ★ WiFi 优先模式 ★
+ *
+ *   ESP32-S3 只有一根天线，BLE 与 WiFi 抢射频。
+ *   WiFi 做 4 次握手（4-way handshake）时正好被 BLE 扫描打断，
+ *   握手就超时（reason=201），表现为「怎么都连不上路由器」。
+ *
+ *   手机端是这块板子的主用途，所以 WiFi 连接期间把扫描停下来，
+ *   连上（或放弃）之后再恢复。
+ */
+static bool s_wifi_priority;
+/* 手机在用时的「省射频」扫描：占空比降到 25%，别把手机的操作手感拖垮，
+   但也不能像以前那样**完全不扫** —— 那样第二台遥控器醒过来永远连不上。 */
+static bool s_scan_thrifty;
 static bool s_auto_dump;
 static char s_target_name[BR_MAX_NAME_LEN];
 
@@ -371,6 +404,18 @@ static void run_pending_defaults(void)
 typedef struct {
     uint16_t attr;
     uint16_t len;
+    /*
+     * ★ 这条通知是**哪台**设备发来的 ★
+     *
+     *   以前队列里只存特征句柄，处理时用「句柄反查是哪台」——
+     *   两台遥控器同时连着时，它们的特征句柄**很可能相同**
+     *   （都是 Chromecast 的 HID 控制特征），
+     *   反查就永远命中第一台 ⇒ 第二台的按键被算到第一台头上，
+     *   查了错的映射表 ⇒ 「有一个遥控器按键没反应」。
+     *
+     *   入队时就把 peer 记下来，处理时直接用，不会串。
+     */
+    int8_t   peer;
     uint8_t  data[AU_ITEM_MAX];
 } au_item_t;
 
@@ -639,6 +684,15 @@ static int  pl_count(void);
  *   只看 s_peers 的话「遥控器醒了 → 扫到 → 用新地址连回去」这条路
  *   在开机后第一次是死的 —— 只能拿旧地址硬撞，每次 5 秒超时。
  *   实测：遥控器 10 分钟里被连了 115 次全部超时，就是这么来的。
+ */
+/*
+ * ★ 只比广播地址 ★
+ *   这版 NimBLE 的广播事件里**没有 identity（固定 MAC）字段**
+ *   （host-based privacy 没开，ota_addr 那个字段不存在），
+ *   所以认不出「同一台遥控器换了广播地址」。
+ *   后果：已配对的那台如果换了地址，在配对窗口里会被当成新遥控器抢走窗口。
+ *   根治办法不在这里 —— PC 端把候选列表摆出来，
+ *   用户点选要配的那一台（客户端早就收齐了候选，只是以前没界面）。
  */
 static bool is_tracked_addr(const uint8_t *addr)
 {
@@ -965,6 +1019,35 @@ static int scan_event(struct ble_gap_event *event, void *arg)
                 s_pair_fresh_type = event->disc.addr.type;
                 s_pair_fresh_ready = true;
                 ESP_LOGI(TAG, "pair window: accepting %s", addr);
+                /*
+                 * ★ 告诉 PC「正在配这一台」★
+                 *   否则 PC 界面上一片安静，用户以为板子没反应
+                 *   （其实板子已经在连了）。
+                 *
+                 * ★ 同时也把它当候选报上去 ★
+                 *   自动抓取抢在扫描会话前面把遥控器抓走时，
+                 *   PC 的候选列表是空的 —— 用户看着像「扫不到这台」，
+                 *   其实是「它已经被板子抓去配了」。
+                 */
+                {
+                    br_kv_t skv;
+                    br_kv_init(&skv);
+                    br_kv_add_int(&skv, "rssi", event->disc.rssi);
+                    br_kv_add(&skv, "addr", addr);
+                    br_kv_add_int(&skv, "type", s_pair_type);
+                    br_kv_add(&skv, "name", raw_name[0] ? raw_name : "");
+                    br_kv_add_int(&skv, "score", 100);
+                    br_kv_add_int(&skv, "idx", 0);
+                    br_kv_add_int(&skv, "adv", (int)event->disc.event_type);
+                    br_proto_send_ev("SCAN", &skv);
+                }
+                {
+                    br_kv_t pkv;
+                    br_kv_init(&pkv);
+                    br_kv_add(&pkv, "addr", addr);
+                    br_kv_add(&pkv, "name", raw_name[0] ? raw_name : "");
+                    br_proto_send_ev("PAIRTARGET", &pkv);
+                }
             }
         }
 
@@ -1021,30 +1104,70 @@ static int scan_event(struct ble_gap_event *event, void *arg)
                                   sizeof(s_candidates[i].name));
                     s_candidates[i].name_known = true;
                     s_candidates[i].adv_type = (uint8_t)event->disc.event_type;
-                    ESP_LOGI(TAG, "cand %s name resolved: %s",
+                    ESP_LOGD(TAG, "cand %s name resolved: %s",
                              addr, s_candidates[i].name);
                     /* 重新算分并重发一条 SCAN 事件 */
                     s_candidates[i].score = score;
-                    br_kv_t kv;
-                    br_kv_init(&kv);
-                    br_kv_add_int(&kv, "rssi", s_candidates[i].rssi);
-                    br_kv_add(&kv, "addr", addr);
-                    br_kv_add_int(&kv, "type", s_candidates[i].addr_type);
-                    br_kv_add(&kv, "name", s_candidates[i].name);
-                    br_kv_add(&kv, "why", why);
-                    br_kv_add_int(&kv, "score", score);
-                    br_kv_add_int(&kv, "idx", i);
-                    br_kv_add_int(&kv, "adv", (int)event->disc.event_type);
-                    br_proto_send_ev("SCAN", &kv);
+                    /*
+                     * ★ 只在扫描会话里才发 ★
+                     *   名字解析这条路径原来是无条件发的 —— 周围 BLE 设备一多，
+                     *   协议行就刷成洪水（实测 USB CDC 一直 "Flush failed"），
+                     *   发送任务忙着重试 → CPU 被占 → 手机端的 HTTP 响应变慢，
+                     *   语音 PCM 每包能卡 5 秒。跟批量上报那条路径保持一致。
+                     */
+                    if (s_scan_session_active) {
+                        br_kv_t kv;
+                        br_kv_init(&kv);
+                        br_kv_add_int(&kv, "rssi", s_candidates[i].rssi);
+                        br_kv_add(&kv, "addr", addr);
+                        br_kv_add_int(&kv, "type", s_candidates[i].addr_type);
+                        br_kv_add(&kv, "name", s_candidates[i].name);
+                        br_kv_add(&kv, "why", why);
+                        br_kv_add_int(&kv, "score", score);
+                        br_kv_add_int(&kv, "idx", i);
+                        br_kv_add_int(&kv, "adv", (int)event->disc.event_type);
+                        br_proto_send_ev("SCAN", &kv);
+                    }
                 }
                 return 0;
             }
         }
+        /*
+         * ★ 候选表满了要「挤掉最没用的」，不能直接丢掉新的 ★
+         *
+         *   周围十几个设备（音箱、手机、手环…）很快就把 16 个格子占满，
+         *   而用户真正要配的那台遥控器是**按一下才广播**的 ——
+         *   它出现时表已经满了，于是被直接丢掉，
+         *   用户看到的现象就是「怎么扫都扫不出来，怎么都配不上」。
+         *
+         *   规则：先挤掉**没名字**的里信号最弱的；
+         *   全都有名字就挤掉信号最弱的。
+         */
+        int slot = -1;
         if (s_candidate_count >= BR_MAX_CANDIDATES) {
-            return 0;
+            for (int i = 0; i < s_candidate_count; i++) {
+                if (s_candidates[i].used && !s_candidates[i].name_known) {
+                    if (slot < 0 || s_candidates[i].rssi < s_candidates[slot].rssi) {
+                        slot = i;
+                    }
+                }
+            }
+            if (slot < 0) {
+                for (int i = 0; i < s_candidate_count; i++) {
+                    if (slot < 0 || s_candidates[i].rssi < s_candidates[slot].rssi) {
+                        slot = i;
+                    }
+                }
+            }
+            if (slot < 0) {
+                return 0;
+            }
+            ESP_LOGD(TAG, "候选表满，挤掉信号最弱的那个");
+        } else {
+            slot = s_candidate_count++;
         }
 
-        br_candidate_t *c = &s_candidates[s_candidate_count++];
+        br_candidate_t *c = &s_candidates[slot];
         memset(c, 0, sizeof(*c));
         c->used = true;
         memcpy(c->addr, event->disc.addr.val, 6);
@@ -1065,7 +1188,7 @@ static int scan_event(struct ble_gap_event *event, void *arg)
         c->adv_type = (uint8_t)event->disc.event_type;
         snprintf(c->why, sizeof(c->why), "%s", why);
 
-        ESP_LOGI(TAG, "cand %s '%s' rssi=%d score=%d (%s)",
+        ESP_LOGD(TAG, "cand %s '%s' rssi=%d score=%d (%s)",
                  addr, c->name_known ? c->name : "(未命名)", c->rssi, c->score,
                  why);
 
@@ -1083,7 +1206,7 @@ static int scan_event(struct ble_gap_event *event, void *arg)
         s_scanning = false;
         s_scan_round_done = true;
         s_round_done_at = esp_timer_get_time();
-        ESP_LOGI(TAG, "scan round complete");
+        ESP_LOGD(TAG, "scan round complete");
         return 0;
 
     default:
@@ -1103,6 +1226,25 @@ bool br_ble_scan_session_start(bool continuous)
     s_emit_done = 0;
     s_emit_upto = 0;
     s_scan_session_active = false;
+    /*
+     * ★ PC 点了「扫描」= 用户想自己挑一台 ★
+     *   这时**关掉配对窗口的自动抓取** ——
+     *   两个功能会互相打架：
+     *     自动抓取会先抢到遥控器、随即停掉扫描，
+     *     于是 PC 的候选列表一直是空的（用户看着像「扫不到」）；
+     *     而「扫描」又会清空候选表，把自动抓取的结果冲掉。
+     *   所以：**手动扫描与自动抓对互斥**，用户选了哪个就只用哪个。
+     */
+    s_auto_pair_until = 0;
+    bridge_led_set_pairing(false);
+    /* ★ 手动扫描也先断开已连的 ★（扫描与连接抢控制器会把链路挤断） */
+    for (int i = 0; i < BR_MAX_PEERS; i++) {
+        if (s_peers[i].used && s_peers[i].connected) {
+            ESP_LOGI(TAG, "扫描：先断开已连接的 peer %d，专心扫描", i);
+            ble_gap_terminate(s_peers[i].conn_handle,
+                              BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
     return br_ble_scan_start(continuous);
 }
 
@@ -1122,8 +1264,29 @@ bool br_ble_scan_start(bool continuous)
  * 区别：不发 SCANSTART —— 那是 PC 端「扫描」按钮的信号，
  * 自动扫描每几秒发一次的话，客户端的候选列表会被一直冲掉。
  */
+void br_ble_note_phone_activity(void)
+{
+    /* 3 秒：足够让一次滑动的��续事件都落在窗口里 */
+    s_phone_busy_until = esp_timer_get_time() + 3000000;
+}
+
+bool br_ble_phone_busy(void)
+{
+    return esp_timer_get_time() < s_phone_busy_until;
+}
+
 bool br_ble_scan_round_quiet(void)
 {
+    return scan_start_internal(false, true);
+}
+
+/** 省射频版静默扫描（手机在用的时候用这个，而不是干脆不扫） */
+bool br_ble_scan_round_quiet_thrifty(void)
+{
+    if (s_scanning) {
+        return true;
+    }
+    s_scan_thrifty = true;
     return scan_start_internal(false, true);
 }
 
@@ -1168,7 +1331,44 @@ static bool scan_start_internal(bool continuous, bool quiet)
      * itvl=16/window=16（10ms/10ms）= 100% 占空比，
      * 跟 NimBLE 自己连���时用的扫描参数一样（它也是 16/16）。
      */
+    /*
+     * ★ 占空比：什么时候要 100% ★
+     *
+     *   遥控器（尤其**配对模式**下）发的是很短的广播：
+     *   37% 的占空比很容易**整段错过** ——
+     *   表现就是「PC 的蓝牙能扫到它，板子扫了半小时却一次没看见」。
+     *
+     *   板子自动重连用的静默扫描一直就是 100%（16/16），
+     *   那条路能抓到遥控器醒来的那一下广播。
+     *   所以：**凡是「要找到遥控器」的场合都用 100%** ——
+     *   静默扫描、配对窗口、PC 的扫描会话，一视同仁。
+     */
     if (quiet) {
+        if (s_scan_thrifty) {
+            /* 手机在用：25ms 窗口 / 100ms 间隔（25%）——
+               遥控器被按键唤醒时会连发几十个广播，这个占空比足够抓到，
+               同时给手机链路留出空气。 */
+            params.itvl = 160;
+            params.window = 40;
+        } else {
+            /* 静默扫描（平时抓已配对遥控器醒来的广播）：占空比拉满 */
+            params.itvl = 16;
+            params.window = 16;
+        }
+        s_scan_thrifty = false;
+    } else if (s_scan_session_active || s_auto_pair_until) {
+        /*
+         * ★ 配对/扫描会话：占空比拉满（16/16）★
+         *
+         *   Chromecast 遥控器在配对模式下**广播窗口很短**，
+         *   25% 占空比（legacy 的参数）实测会**整个错过** ——
+         *   90 秒的扫描窗口里一次都没抓到它。
+         *   所以抓取阶段必须 100%。
+         *
+         *   代价是「停扫描 → 发起连接」的时序变紧（下面把
+         *   CONNECT_SETTLE_MS 加长 + 连接看门狗兜底），
+         *   两条一起才既抓得到、又连得上、还不会卡死。
+         */
         params.itvl = 16;
         params.window = 16;
     }
@@ -1211,7 +1411,7 @@ static bool scan_start_internal(bool continuous, bool quiet)
         return false;
     }
     s_scanning = true;
-    ESP_LOGI(TAG, "scanning started (continuous=%d)", continuous ? 1 : 0);
+    ESP_LOGD(TAG, "scanning started (continuous=%d)", continuous ? 1 : 0);
     return true;
 }
 
@@ -1841,13 +2041,27 @@ static void request_conn_params(br_peer_t *p)
     memset(&params, 0, sizeof(params));
     params.itvl_min = 24;              /* 30ms */
     params.itvl_max = 24;              /* 30ms */
-    params.latency = 50;               /* 从机可以偷懒 50 个事件 */
+    /*
+     * ★ latency 不能给 50 ★
+     *
+     *   50 × 30ms = 1.5 秒从机可以不响应。
+     *   单台时没问题，**两台同时连着就撑不住**：
+     *   加上 WiFi 抢射频，链路直接报 LL Response Timeout 被断
+     *   （HCI 0x22）—— 症状就是「配了第二台，第一台按键就失效」。
+     *   改成 8（约 240ms）：还省电，但链路稳得住。
+     */
+    params.latency = 8;
     params.supervision_timeout = 500;  /* 5 秒 */
     params.min_ce_len = 0;
     params.max_ce_len = 0;
 
     int rc = ble_gap_update_params(p->conn_handle, &params);
-    ESP_LOGI(TAG, "请求连接参数 itvl=30ms lat=50 to=5s rc=%d", rc);
+    /* ★ 打印**真实**参数值，别写死 ★
+       以前这里硬编码 "lat=50"，改了代码日志还显示 50，
+       排查时会以为没生效。 */
+    ESP_LOGI(TAG, "请求连接参数 itvl=%u lat=%u to=%u rc=%d",
+             (unsigned)params.itvl_min, (unsigned)params.latency,
+             (unsigned)params.supervision_timeout, rc);
     if (rc != 0) {
         /* 对端可能拒绝；不重试，靠 HID 的保活读兜底 */
         ESP_LOGW(TAG, "连接参数请求失败 rc=%d", rc);
@@ -1923,6 +2137,43 @@ static bool pl_get(int i, uint8_t addr[6], uint8_t *type,
 static int  pl_count(void);
 static bool pl_put(const uint8_t *addr, uint8_t type, const char *name,
                    const uint8_t *id_addr, uint8_t id_type, bool has_id);
+
+/*
+ * ★ 登记了、但当前没连上的遥控器有几台 ★
+ *
+ *   多台遥控器时这是常态：一台连着、另一台在睡觉。
+ *   自动扫描的目的就是「抓已登记的那台刚醒来的广播」，
+ *   所以**只要还有没连上的，就必须继续扫** ——
+ *   以前条件写的是「一个遥控器都没连才扫」，
+ *   于是「一台连着」就把扫描停了，另一台永远连不上
+ *   （症状：只能配/只能用一台，多台永远只有第一台是活的）。
+ */
+static int registered_offline_count(void)
+{
+    int n = 0;
+    int cnt = pl_count();
+    for (int i = 0; i < cnt; i++) {
+        uint8_t addr[6];
+        uint8_t type;
+        char name[BR_MAX_NAME_LEN];
+        if (!pl_get(i, addr, &type, name, sizeof(name))) {
+            continue;
+        }
+        bool online = false;
+        for (int j = 0; j < BR_MAX_PEERS; j++) {
+            if (s_peers[j].used && s_peers[j].connected &&
+                memcmp(s_peers[j].addr, addr, 6) == 0) {
+                online = true;
+                break;
+            }
+        }
+        if (!online) {
+            n++;
+        }
+    }
+    return n;
+}
+
 static int  pl_find(const uint8_t *addr);
 static int  pl_find_by_id(const uint8_t *id);
 static bool pl_get_profile(int i, char *out, size_t cap);
@@ -1938,6 +2189,7 @@ static int conn_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT: {
         s_connect_in_progress = false;
+        s_connect_deadline = 0;
 
         if (event->connect.status != 0) {
             s_last_conn_status = event->connect.status;
@@ -2075,6 +2327,8 @@ static int conn_event(struct ble_gap_event *event, void *arg)
             br_kv_add(&pkv, "name", p->name);
             br_kv_add_int(&pkv, "ok", 1);
             br_proto_send_ev("PAIR", &pkv);
+            /* 绿灯闪一下：告诉用户「成了」（遥控器马上就睡，灯会回到蓝呼吸） */
+            bridge_led_pair_ok();
             ESP_LOGI(TAG, "PAIR ok: %s '%s'", addr, p->name);
         }
 
@@ -2160,7 +2414,13 @@ static int conn_event(struct ble_gap_event *event, void *arg)
             addr_to_str(s_peers[idx].addr, addr, sizeof(addr));
             ESP_LOGI(TAG, "disconnected: %s reason=%d", addr,
                      event->disconnect.reason);
-            bridge_led_set_connected(false);
+            /*
+             * ★ 断开一台 ≠ 都没连着 ★
+             *   多台遥控器时，掉的那台会让**另一台明明连着的**
+             *   也显示成「未连接」—— 灯一直蓝呼吸，用户以为板子没连上。
+             *   所以只有「一台都不剩」才置未连接。
+             */
+            bridge_led_set_connected(br_ble_connected_count() > 0);
             char why[64];
             conn_status_desc(event->disconnect.reason, why, sizeof(why));
             br_kv_t kv;
@@ -2281,6 +2541,7 @@ static int conn_event(struct ble_gap_event *event, void *arg)
         memset(&item, 0, sizeof(item));
         item.attr = attr;
         item.len = n;
+        item.peer = (int8_t)idx;   /* ★ 记下是哪台，别靠句柄反查 ★ */
         memcpy(item.data, OS_MBUF_DATA(dup, uint8_t *), n);
 
         /* 队列满：丢最旧的一条，优先保新数据（音频流后面才是当前语音） */
@@ -2316,11 +2577,31 @@ bool br_ble_connect_addr(const uint8_t *addr, uint8_t addr_type,
      * 所以先把 s_connect_in_progress 置上，调度器就不会再动扫描。
      */
     s_connect_in_progress = true;
+    /* ★ 连接死锁的兜底时刻 ★
+       控制器要是没执行这次连接（射频忙/扫描没停干净），
+       CONNECT 事件永远不来，连接槽就被永久占死 ——
+       表现是「抓到目标了却再也配不上」。
+       到点还没结果就强行放开，让下一次重试有机会。 */
+    s_connect_deadline = esp_timer_get_time() + (int64_t)CONNECT_WATCHDOG_MS * 1000;
 
     /* 扫描与连接严格串行：连接前先确保扫描停下来 */
     if (s_scanning) {
         int drc = ble_gap_disc_cancel();
         s_scanning = false;
+        /*
+         * ★ 必须把「连续扫描」的两个标志一起复位 ★
+         *
+         *   这里绕过 br_ble_scan_stop() 直接 cancel，如果只清 s_scanning，
+         *   就会留下 s_scan_continuous=1 / s_scan_round_done=0 ——
+         *   主循环里两条恢复路径因此同时失效：
+         *     · 自动扫描那块要求 !s_scan_continuous
+         *     · 「本轮结束再开下一轮」要求 s_scan_round_done
+         *   结果：**连上一台遥控器之后板子就再也不扫描了**，
+         *   第二台遥控器被按键唤醒也永远抓不到（用户实测：两台配对好只有一台能用）。
+         *   实测诊断字段：scanning=0 cont=1 rd=0 offl=1 —— 正是这个死结。
+         */
+        s_scan_continuous = false;
+        s_scan_round_done = false;
         ESP_LOGI(TAG, "连接前停扫描: disc_cancel rc=%d, 等 %dms 让控制器收尾",
                  drc, CONNECT_SETTLE_MS);
         vTaskDelay(pdMS_TO_TICKS(CONNECT_SETTLE_MS));
@@ -2337,8 +2618,6 @@ bool br_ble_connect_addr(const uint8_t *addr, uint8_t addr_type,
     s_connecting_type = addr_type;
     sanitize_name(name ? name : "", s_connecting_name,
                   sizeof(s_connecting_name));
-
-    bridge_led_set_connected(false);
 
     /*
      * ★ 第一个参数是**本机**地址类型；远端地址类型走 peer_addr.type。
@@ -2907,6 +3186,12 @@ static void pair_window_close(void)
     /* 配对窗口还开着的话，扫描要继续（还能再收别的遥控器） */
     if (!s_auto_pair_until) {
         s_scan_continuous = s_scan_continuous_before_pair;
+        /*
+         * ★ 窗口关了，蓝灯也要灭 ★
+         *   以前这里只清标志，灯还停在「配对中」——
+         *   用户看到的就是「配对早结束了，灯还在蓝闪」。
+         */
+        bridge_led_set_pairing(false);
     }
 }
 
@@ -2934,6 +3219,26 @@ bool br_ble_pair_window_start(int seconds)
     /* 窗口期间必须一直扫，不然看不到遥控器什么时候醒 */
     s_scan_continuous_before_pair = s_scan_continuous;
     s_scan_continuous = true;
+    /*
+     * ★ 配对期间先把已连的遥控器断开 ★
+     *
+     *   legacy 的配对模式就是「专心扫描，不主动连」。
+     *   现在两台驱动 + 100% 占空比扫描会把链路挤断
+     *   （reason=546 LL Response Timeout），所以配对开始时
+     *   主动断开已有的连接，让射频专心找新遥控器。
+     *   遥控器配对完/窗口关掉后会自己连回来。
+     */
+    for (int i = 0; i < BR_MAX_PEERS; i++) {
+        if (s_peers[i].used && s_peers[i].connected) {
+            ESP_LOGI(TAG, "配对窗口：先断开已连接的 peer %d，专心扫描", i);
+            ble_gap_terminate(s_peers[i].conn_handle,
+                              BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
+    /* ★ 自动抓对与手动扫描互斥 ★
+       开了配对窗口就把 PC 的扫描会话收掉，
+       否则两边抢扫描、抢候选表，谁都做不成。 */
+    s_scan_session_active = false;
     br_ble_scan_start(true);
     bridge_led_set_pairing(true);
     ESP_LOGI(TAG, "pair window open: %d s", seconds);
@@ -3265,6 +3570,40 @@ int br_ble_list_remotes(void)
         num++;
     }
 
+    /*
+     * ★ 手机（临时遥控器）也当一台遥控器报上去 ★
+     *   手机没有 BLE 地址，用固定伪地址 50:50:50:50:50:50；
+     *   kind=phone 让 PC 端知道要用「手机」那套键位（usage 空间是 6:）。
+     *   PC 端在这个条目上配的映射会按同一个伪地址下发回来，
+     *   板子存到同一个 key —— 与谷歌遥控器的映射物理上隔离。
+     */
+    {
+        uint8_t paddr[6] = BR_PHONE_ADDR;
+        char paddr_s[24];
+        addr_to_str(paddr, paddr_s, sizeof(paddr_s));
+
+        br_kv_t pkv;
+        br_kv_init(&pkv);
+        /* idx 用 PL_MAX —— 真实槽位下标都小于它，不会撞 */
+        br_kv_add_int(&pkv, "idx", PL_MAX);
+        br_kv_add(&pkv, "addr", paddr_s);
+        br_kv_add_int(&pkv, "type", 0);
+        br_kv_add(&pkv, "name", "手机（临时遥控器）");
+        /*
+         * ★ 在线状态看实际心跳，不写死 ★
+         *   手机是 WiFi 设备：开着页面才会每 2~3 秒发一次心跳。
+         *   以前固定 conn=1 —— 手机根本没连，PC 端却显示「已连接」。
+         */
+        br_kv_add_int(&pkv, "conn", br_phone_recently_active() ? 1 : 0);
+        br_kv_add_int(&pkv, "voice", 0);
+        br_kv_add_int(&pkv, "bonded", 0);
+        br_kv_add(&pkv, "id", paddr_s);
+        br_kv_add(&pkv, "kind", "phone");
+        br_kv_add_int(&pkv, "binds", br_mapping_count(paddr));
+        br_proto_send_dt("RM", &pkv);
+        num++;
+    }
+
     br_kv_t kv;
     br_kv_init(&kv);
     br_kv_add_int(&kv, "count", num);
@@ -3434,6 +3773,31 @@ void br_ble_set_auto(bool on)
     ESP_LOGI(TAG, "auto mode %s", on ? "on" : "off");
 }
 
+/**
+ * WiFi 优先模式开关。
+ *
+ * 打开时暂停自动扫描（已建立的连接不动），让 WiFi 独占射频做握手。
+ * 关闭后自动扫描恢复。
+ */
+void br_ble_set_wifi_priority(bool on)
+{
+    if (s_wifi_priority == on) {
+        return;
+    }
+    s_wifi_priority = on;
+    if (on) {
+        /* 握手期间不能有 BLE 扫描在抢射频 */
+        if (s_scanning && !s_pair_pending) {
+            br_ble_scan_stop();
+        }
+        /* 立刻安排下一轮扫描（模式关闭后马上接上） */
+        s_next_pick = 0;
+    } else {
+        s_next_pick = 0;
+    }
+    ESP_LOGI(TAG, "wifi priority %s", on ? "on" : "off");
+}
+
 void br_ble_set_auto_dump(bool on)
 {
     s_auto_dump = on;
@@ -3481,6 +3845,13 @@ void br_ble_dump_state(void)
     br_kv_t kv;
     br_kv_init(&kv);
     br_kv_add_int(&kv, "scanning", s_scanning ? 1 : 0);
+    /* 诊断：自动扫描为什么没跑（auto/cont/round_done/busy/offline） */
+    br_kv_add_int(&kv, "auto", s_auto ? 1 : 0);
+    br_kv_add_int(&kv, "cont", s_scan_continuous ? 1 : 0);
+    br_kv_add_int(&kv, "rd", s_scan_round_done ? 1 : 0);
+    br_kv_add_int(&kv, "busy", br_ble_phone_busy() ? 1 : 0);
+    br_kv_add_int(&kv, "offl", registered_offline_count());
+    br_kv_add_int(&kv, "ledact", (long)bridge_led_activity_count());
     br_kv_add_int(&kv, "candidates", s_candidate_count);
     br_kv_add_int(&kv, "peers", s_peer_count);
     br_kv_add_int(&kv, "connecting", s_connect_in_progress ? 1 : 0);
@@ -3488,6 +3859,19 @@ void br_ble_dump_state(void)
     br_kv_add_int(&kv, "fresh", s_pair_fresh_ready ? 1 : 0);
     /* NVS 配对表里有几台 —— 「已配对的遥控器」为空时先看这个 */
     br_kv_add_int(&kv, "paired", pl_count());
+    /*
+     * ★ 把「正在连谁 / 正在配谁」也报上去 ★
+     *   只看 connecting=1 根本不知道它卡在哪个地址上 ——
+     *   是「抓错了设备」（名字像遥控器其实是别的）还是「地址旧了」。
+     */
+    {
+        char cs[24];
+        addr_to_str(s_connecting_addr, cs, sizeof(cs));
+        br_kv_add(&kv, "conn_to", cs);
+        addr_to_str(s_pair_addr, cs, sizeof(cs));
+        br_kv_add(&kv, "pair_to", cs);
+        br_kv_add(&kv, "pair_name", s_pair_name);
+    }
 
     /*
      * ★ 把**本机**身份地址打出来 ★
@@ -3822,25 +4206,36 @@ static void br_ble_task(void *arg)
 
         /*
          * ★ 把扫描回调记下的候选发成协议行 ★
+         *
+         * ★ 只在「PC 明确要求扫描」时才发 ★
+         *   自动静默扫（找已配对遥控器）时那些候选没人要，
+         *   但每秒几十条协议行会把 USB CDC 写满 ——
+         *   写满之后 tx 任务一直在重试，CPU 被烧掉，
+         *   手机那边的 HTTP 响应就慢了，触控板卡得没法用。
+         *   板子把扫描结果发给 PC 的场合，只有 PC 点「扫描」那一次。
          */
-        while (s_emit_done < s_emit_upto) {
-            int i = s_emit_done;
-            br_candidate_t *c = &s_candidates[i];
-            char addr[24];
-            addr_to_str(c->addr, addr, sizeof(addr));
+        if (!s_scan_session_active) {
+            s_emit_done = s_emit_upto;       /* 不发，直接丢掉 */
+        } else {
+            while (s_emit_done < s_emit_upto && !br_ble_phone_busy()) {
+                int i = s_emit_done;
+                br_candidate_t *c = &s_candidates[i];
+                char addr[24];
+                addr_to_str(c->addr, addr, sizeof(addr));
 
-            br_kv_t kv;
-            br_kv_init(&kv);
-            br_kv_add_int(&kv, "rssi", c->rssi);
-            br_kv_add(&kv, "addr", addr);
-            br_kv_add_int(&kv, "type", s_candidates[i].addr_type);
-            br_kv_add(&kv, "name", c->name);
-            br_kv_add(&kv, "why", c->why);
-            br_kv_add_int(&kv, "score", c->score);
-            br_kv_add_int(&kv, "idx", i);
-            br_kv_add_int(&kv, "adv", c->adv_type);
-            br_proto_send_ev("SCAN", &kv);
-            s_emit_done++;
+                br_kv_t kv;
+                br_kv_init(&kv);
+                br_kv_add_int(&kv, "rssi", c->rssi);
+                br_kv_add(&kv, "addr", addr);
+                br_kv_add_int(&kv, "type", s_candidates[i].addr_type);
+                br_kv_add(&kv, "name", c->name);
+                br_kv_add(&kv, "why", c->why);
+                br_kv_add_int(&kv, "score", c->score);
+                br_kv_add_int(&kv, "idx", i);
+                br_kv_add_int(&kv, "adv", c->adv_type);
+                br_proto_send_ev("SCAN", &kv);
+                s_emit_done++;
+            }
         }
 
         /*
@@ -3850,28 +4245,19 @@ static void br_ble_task(void *arg)
             au_item_t item;
             int drained = 0;
             while (drained < 32 && xQueueReceive(s_auq, &item, 0) == pdTRUE) {
-                int idx = -1;
-                for (int i = 0; i < BR_MAX_PEERS; i++) {
-                    if (s_peers[i].used && s_peers[i].connected &&
-                        s_peers[i].atvv_ctl_handle == item.attr) {
-                        idx = i;
-                        break;
-                    }
-                }
+                /*
+                 * ★ 用入队时记下的 peer，别用句柄反查 ★
+                 *   两台遥控器同时连着时特征句柄会撞车，
+                 *   反查会永远命中第一台 → 第二台的按键就废了。
+                 */
+                int idx = (item.peer >= 0 && item.peer < BR_MAX_PEERS)
+                              ? (int)item.peer : -1;
                 const char *kind = "NT";
-                for (int i = 0; i < BR_MAX_PEERS; i++) {
-                    if (!s_peers[i].used || !s_peers[i].connected) {
-                        continue;
-                    }
-                    if (s_peers[i].atvv_audio_handle == item.attr) {
+                if (idx >= 0 && s_peers[idx].used && s_peers[idx].connected) {
+                    if (s_peers[idx].atvv_audio_handle == item.attr) {
                         kind = "AU";
-                        idx = i;
-                        break;
-                    }
-                    if (s_peers[i].atvv_ctl_handle == item.attr) {
+                    } else if (s_peers[idx].atvv_ctl_handle == item.attr) {
                         kind = "CTL";
-                        idx = i;
-                        break;
                     }
                 }
 
@@ -3936,8 +4322,18 @@ static void br_ble_task(void *arg)
          *   新鲜广播那条最可靠的路径就再也挤不进来，
          *   表现就是「明明扫到遥控器了，配对还是失败」。
          */
-        if (s_pair_fresh_ready && !s_connect_in_progress &&
-            br_ble_connected_count() == 0) {
+        /*
+         * ★ 不要因为「已经有一台连着」就不连新的 ★
+         *
+         *   这里原来带着 `br_ble_connected_count() == 0`，
+         *   那是**单设备时代**的写法（板子一次只连一台）。
+         *   改成多台以后它就变成了：
+         *     第一台连上 → 后面新抓到的遥控器**永远连不上**
+         *   —— 症状正是「只能配一台 / 配第二台没反应」。
+         *   多台并存本来就是要支持的：已连着的照旧，
+         *   新抓到的用新地址连上去。
+         */
+        if (s_pair_fresh_ready && !s_connect_in_progress) {
             s_pair_fresh_ready = false;
             char fresh[24];
             addr_to_str(s_pair_fresh_addr, fresh, sizeof(fresh));
@@ -3961,12 +4357,34 @@ static void br_ble_task(void *arg)
          * 也就是说：一次广播都没看成，全程拿一个地址硬连。
          * 顺序调到这里，失败后先恢复扫描，瞎试只在「扫描没在跑」时才发生。
          */
+        /*
+         * ★ 扫描的恢复也不该要求「一台都没连着」 ★
+         *
+         *   原来这里也是 `br_ble_connected_count() == 0`，
+         *   于是**第一台连上以后，扫描就再也起不来了** ——
+         *   不只是连不上，连「发现」都做不到（用户点扫描也没反应）。
+         *
+         *   板子支持多台，扫描就得一直能开：
+         *   已连着的那些由它们自己的链路维持，
+         *   扫描只管把新出现的设备找出来。
+         */
+        /*
+         * ★ 平时「已经连着遥控器」就别扫了 —— 否则会把链路挤断 ★
+         *
+         *   实测：两台同时连着 + 100% 占空比扫描 ⇒ 控制器没时隙，
+         *   物理层判 LL Response Timeout（reason=546 / HCI 0x22），
+         *   刚配上的那台一直在「连上→断→重连」，服务发现永远做不完
+         *   ⇒ 按键全没反应。
+         *
+         *   所以按 legacy 的模型：**平时不扫**（连接稳），
+         *   **配对时才扫**（这时板子会先把已连的断开，见 pair_window_start）。
+         */
         if (s_scan_continuous && !s_scanning && !s_connect_in_progress &&
-            br_ble_connected_count() == 0) {
-            /*
-             * ★ 已经连上一台就别再扫了 ★
-             *   扫描和连接抢控制器，遥控器会判定拥塞直接断链。
-             */
+            br_ble_connected_count() < 2) {
+            /* ★ 一台连着也要继续扫 ★
+               否则第二台遥控器被按键唤醒也永远连不上（用户实测）。
+               两台都连上以后就不再扫 —— 两条链路 + 扫描会把控制器挤爆
+               （LL Response Timeout，reason=546）。 */
             br_ble_scan_start(true);
         }
 
@@ -3984,6 +4402,41 @@ static void br_ble_task(void *arg)
             s_auto_pair_until = esp_timer_get_time() + 30LL * 1000000LL;
             s_scan_continuous = true;
             if (!s_scanning) {
+                br_ble_scan_start(true);
+            }
+        }
+
+        /*
+         * ★ 连接看门狗 ★
+         *
+         *   连接请求发出去之后，控制器一直没执行（射频被扫描占满、
+         *   扫描没停干净）—— CONNECT 事件永远不来，
+         *   s_connect_in_progress 就永久占着连接槽，
+         *   **之后谁都配不上**（症状：抓到目标了、名字也对，就是配不上）。
+         *
+         *   到点还没结果就强行放开，让下一次重试有机会。
+         */
+        if (s_connect_in_progress && s_connect_deadline &&
+            esp_timer_get_time() >= s_connect_deadline) {
+            char cs[24];
+            addr_to_str(s_connecting_addr, cs, sizeof(cs));
+            ESP_LOGW(TAG, "连接看门狗超时（%u ms 无 CONNECT），放开 %s",
+                     (unsigned)CONNECT_WATCHDOG_MS, cs);
+            s_connect_in_progress = false;
+            s_connect_deadline = 0;
+            s_pair_fresh_ready = false;
+            br_kv_t kv;
+            br_kv_init(&kv);
+            br_kv_add_int(&kv, "status", 13);
+            br_kv_add(&kv, "why", "watchdog-timeout");
+            br_proto_send_ev("CONNFAIL", &kv);
+            /*
+             * ★ 放开连接槽后要把扫描恢复起来 ★
+             *   连接前为了抢射频把扫描停了 ——
+             *   不恢复的话，后面就再没有机会抓到目标了
+             *   （症状：第一次没连上，之后永远配不上）。
+             */
+            if (s_scan_continuous && !s_scanning) {
                 br_ble_scan_start(true);
             }
         }
@@ -4060,7 +4513,27 @@ static void br_ble_task(void *arg)
          * 旧 bond 地址无法唤醒它。扫描回调只记录已登记遥控器的新鲜地址，
          * 实际连接由上面的主循环分支发起；已有连接时停止扫描。
          */
-        if (s_auto && br_ble_connected_count() == 0 &&
+        /*
+         * ★ 持续扫描：这一轮结束了要接着开下一轮 ★
+         *
+         *   扫描是按轮跑的（一轮 SCAN_ROUND_MS），一轮结束就没了 ——
+         *   以前**没有人再启动它**（s_scan_round_done 设了没人读），
+         *   所以「扫描」按钮实际只扫了一轮：
+         *   用户点完扫描，等几秒才去按遥控器 → 遥控器广播时
+         *   板子早就不扫了 → 列表里永远没有它 → 「怎么都配不上」。
+         *
+         *   遥控器只在醒着的那一两秒广播，扫多久都不嫌多。
+         */
+        if (s_scan_continuous && s_scan_round_done && !s_scanning &&
+            !s_connect_in_progress && !s_wifi_priority &&
+            now - s_round_done_at > 200000) {
+            /* 歇 200ms 再开下一轮：扫描启动失败时别变成 30ms 一轮的死循环 */
+            s_scan_round_done = false;
+            br_ble_scan_start(true);
+        }
+
+        if (s_auto && !s_wifi_priority &&
+            (br_ble_connected_count() == 0 || registered_offline_count() > 0) &&
             !s_connect_in_progress && !s_scan_continuous) {
             /*
              * ★ 自动模式：只扫，看到广播才连 ★
@@ -4076,8 +4549,18 @@ static void br_ble_task(void *arg)
              */
             if (now >= s_next_pick) {
                 s_next_pick = now + 100000;   /* 每轮约 1 秒，歇 100ms 后续扫 */
-                if (!s_scanning) {
-                    br_ble_scan_round_quiet();
+                /* ★ 手机在用的时候也要扫，只是降占空比 ★
+                 *   以前是「手机忙就完全不扫」——WiFi 时代为了保手机手感，
+                 *   但现在 WiFi 已经关了（BR_LINK_WIFI=0），
+                 *   完全不扫的后果是：第二台遥控器被按键唤醒也永远连不上
+                 *   （用户实测：两台配对好，只有一台能用）。
+                 *   现在降到 25% 占空比：手机仍在可用范围，遥控器也抓得到。 */
+                if (!s_scanning && br_ble_connected_count() < 2) {
+                    if (br_ble_phone_busy() || br_ble_connected_count() > 0) {
+                        br_ble_scan_round_quiet_thrifty();
+                    } else {
+                        br_ble_scan_round_quiet();
+                    }
                 }
             }
             /*
@@ -4197,6 +4680,8 @@ static void on_sync(void)
     setup_own_identity_addr();
     /* 开机后自主运行；扫描 API 只能在 host 同步完成后调用。 */
     br_ble_set_auto(true);
+    /* ★ 手机要连板子：同步完成后开始广播（br_ble_gatt.c）★ */
+    br_ble_gatt_on_sync();
 }
 
 static void on_reset(int reason)
@@ -4272,7 +4757,18 @@ esp_err_t br_ble_init(void)
     }
     br_hid_reset();
 
-    /* 本固件只做 Central，不需要 GATT 服务端 */
+    /*
+     * ★ 同时做 Peripheral ★
+     *   手机 App 是 GATT Client，连板子这个外设。
+     *   服务必须在 host 起来之前登记（在 nimble_port_freertos_init 之前）。
+     *   Central 角色保持不变 —— 蓝牙遥控器照旧由板子主动去连。
+     */
+    {
+        esp_err_t grc = br_ble_gatt_init();
+        if (grc != ESP_OK) {
+            ESP_LOGE(TAG, "GATT 服务注册失败 %d（手机将连不上板子）", grc);
+        }
+    }
     nimble_port_freertos_init(nimble_host_task_fn);
 
     xTaskCreate(br_ble_task, "br_ble", 6144, NULL, 5, NULL);

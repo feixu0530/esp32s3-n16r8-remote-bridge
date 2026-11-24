@@ -28,6 +28,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <esp_system.h>
 #include <driver/uart.h>
 #include <esp_log.h>
 
@@ -110,9 +111,17 @@ void br_uart_init(void)
      *   再加上 ESP_LOG 的格式化缓冲，3072 不够。
      */
     if (xTaskCreate(uart_event_task, "uart_rx", 6144, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "uart task create failed");
-        s_ready = false;
-        return;
+        ESP_LOGE(TAG, "uart task create failed (free=%u)",
+                 (unsigned)esp_get_free_heap_size());
+        /* ★ 退一步再试一次 ★
+           内存紧的时候 6KB 栈申请不出来，UART 命令通道就整条没了 ——
+           而失败是静默的：板子照样活着，只是 PC 发什么命令都不回。 */
+        if (xTaskCreate(uart_event_task, "uart_rx", 3072, NULL, 5, NULL)
+            != pdPASS) {
+            ESP_LOGE(TAG, "uart task create failed even at 3KB");
+            s_ready = false;
+            return;
+        }
     }
     ESP_LOGI(TAG, "UART protocol channel ready @ %d baud", UART_BAUD);
 }

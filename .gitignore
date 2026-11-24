@@ -21,3 +21,19 @@ dev/firmware/bridge/dependencies.lock
 # 二进制资源由 *.b64 + tools/restore_assets.py 还原
 dev/client/src/assets/icons/app.ico
 dev/client/src/assets/remotes/Chromecast-remote-photo.png
+
+dev/firmware/bridge/build_wifi/
+dev/firmware/bridge/sdkconfig.old
+dev/client/build/build_work/
+dev/client/build/dist_scratch/
+dev/client/build/work_scratch/
+temp/
+
+# 生成文件（由 tools/gen_web_assets.py 重建）
+dev/firmware/bridge/main/br_web_assets.c
+dev/firmware/bridge/main/br_web_assets.h
+
+# 证书私钥与第三方解码器源码不入库
+dev/firmware/bridge/tools/esp32s3-remote-ca.key
+dev/firmware/bridge/tools/esp32s3-remote-ca.crt
+tools/g7221/

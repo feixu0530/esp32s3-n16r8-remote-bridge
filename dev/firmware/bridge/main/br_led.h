@@ -28,6 +28,7 @@ void bridge_led_key_up(void);
  * 未连接 -> 蓝色呼吸；已连接 -> 熄灭（等按键再亮）。
  */
 void bridge_led_set_connected(bool on);
+void bridge_led_set_phone_linked(bool on);
 
 /**
  * 正在尝试连接遥控器 —— 蓝色慢呼吸。
@@ -44,6 +45,27 @@ void bridge_led_idle(void);
  * 用户一眼就知道「板子在等人，把遥控器按到配对模式」。
  */
 void bridge_led_set_pairing(bool on);
+
+/**
+ * ★ 配对成功提示 —— 绿灯快闪 1.5 秒 ★
+ *
+ *   配完 Chromecast 遥控器它**立刻就睡了**，板子随即回到
+ *   「未连接 → 蓝色呼吸」—— 用户看着像「还在配对，没成」。
+ *   明确闪一下绿灯，这事就说清楚了。
+ */
+void bridge_led_pair_ok(void);
+
+/**
+ * ★ 手机端有输入（触摸板/陀螺仪/按键/文字）★
+ *
+ *   手机走蓝牙以后，用户看不到 PC 那边接没收到 ——
+ *   灯闪一下就是「板子收到了」的直接反馈。
+ *   30Hz 的 move 会被限流成「持续亮、停手 150ms 后灭」，不会频闪。
+ */
+void bridge_led_phone_activity(void);
+
+/** 手机输入闪灯累计次数（排障/自动化验证用：心跳不该让它增长） */
+uint32_t bridge_led_activity_count(void);
 
 /** 语音通道有数据 */
 void bridge_led_voice_active(void);

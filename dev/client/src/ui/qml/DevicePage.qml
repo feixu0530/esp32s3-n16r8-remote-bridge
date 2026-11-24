@@ -92,10 +92,29 @@ Item {
         return Bridge.connected ? tokens.successColor : tokens.voiceAccent
     }
 
+    /* 手机端（临时遥控器）的联网状态在「手机」页，这里只管设备页的事 */
+
     onVisibleChanged: {
         if (visible) {
             Bridge.refreshDeviceInfo()
             Bridge.refreshVoiceKey()
+            /* 进页面就把板子的联网状态 + 记住的 WiFi 拉回来，
+               不用用户先点一次「刷新」才看得到配网区块的内容 */
+            if (Bridge.connected) {
+                Bridge.refreshWifi()
+                Bridge.refreshWifiNets()
+            }
+        }
+    }
+
+    /* 板子是后插上的也要自动填好配网区块 */
+    Connections {
+        target: Bridge
+        function onConnectedChanged() {
+            if (Bridge.connected) {
+                Bridge.refreshWifi()
+                Bridge.refreshWifiNets()
+            }
         }
     }
 
@@ -441,8 +460,11 @@ Item {
                     titleText: "遥控器"
                     descriptionText: "已连接 / 已配对"
                     descriptionNeverElide: true
-                    stateText: root.connectedRemoteCount() + "/" + RemoteListModel.count
-                    stateColor: root.connectedRemoteCount() > 0
+                    /* ★ 只数蓝牙遥控器 ★
+                       手机是 WiFi 设备，它有自己的页面，不算进蓝牙这一栏。 */
+                    stateText: RemoteListModel.bleConnectedCount + "/"
+                               + RemoteListModel.bleCount
+                    stateColor: RemoteListModel.bleConnectedCount > 0
                         ? tokens.successColor : tokens.disabledText
 
                     CompactButton {
@@ -456,6 +478,39 @@ Item {
                     }
                 }
 
+                /*
+                 * ★ 扫描做成弹窗（跟 Windows / 安卓的「添加设备」一致）★
+                 *
+                 *   以前候选列表直接铺在设备页里，扫描开着就一直往下列里塞，
+                 *   把整个页面拉得老长 —— 用户看着像「板子一直在扫描，停不下来」。
+                 *   现在：点「扫描」→ 弹窗 → 选一台配对 → 弹窗自动关、扫描自动停。
+                 */
+                InlineSettingsRow {
+                    tokens: root.tokens
+                    objectName: "scanRow"
+                    stateColumnWidth: root.stateColumnWidth
+                    actionColumnWidth: root.actionColumnWidth
+                    titleWidth: 180
+                    titleText: "附近的遥控器"
+                    descriptionText: "点右边「扫描」挑一台配对。"
+                                      + "★遥控器只在醒着时广播★ —— 扫着的时候按一下它的任意键"
+                    stateText: Bridge.scanDialogOpen ? "扫描中" : ""
+                    stateColor: tokens.voiceAccent
+
+                    CompactButton {
+                        objectName: "scanToggleButton"
+                        tokens: root.tokens
+                        Layout.fillWidth: true
+                        compactMinimumWidth: root.tokens.buttonWidth6Chars
+                        text: "扫描"
+                        enabled: Bridge.connected
+                        onClicked: {
+                            scanDialog.open()
+                            Bridge.startScan()
+                        }
+                    }
+                }
+
                 Repeater {
                     model: RemoteListModel
                     delegate: InlineSettingsRow {
@@ -466,6 +521,14 @@ Item {
                         required property bool connected
                         required property int binds
                         required property int bindsBoard
+                        required property string kind
+
+                        /*
+                         * ★ 手机不进「蓝牙配对」列表 ★
+                         *   手机走 WiFi，不是蓝牙配对来的设备 ——
+                         *   列在这儿会让人以为它走蓝牙。它在「手机」页。
+                         */
+                        visible: row.kind !== "phone"
 
                         tokens: root.tokens
                         stateColumnWidth: root.stateColumnWidth
@@ -482,7 +545,19 @@ Item {
                             ? row.name : "遥控器 " + (row.index + 1)
                         descriptionText: row.addr
                         descriptionNeverElide: true
-                        stateText: row.connected ? "已连接" : "未连接"
+                        /*
+                         * ★ 别只写「未连接」★
+                         *   Chromecast 遥控器空闲时**完全不广播**（省电），
+                         *   所以「已配对但现在没连着」是常态 ——
+                         *   以前界面写「未连接」，用户以为没配上，
+                         *   就把配对删了（配对记录一删，那台再也回不来）。
+                         *   现在说清楚：还配着呢，按一下遥控器它就醒。
+                         */
+                        stateText: row.connected
+                            ? "已连接"
+                            : (RemoteListModel.count > 0
+                                ? "已配对 · 遥控器在睡觉"
+                                : "未连接")
                         stateColor: row.connected
                             ? tokens.successColor : tokens.disabledText
 
@@ -505,9 +580,65 @@ Item {
                             Layout.fillWidth: true
                             compactMinimumWidth: root.tokens.buttonWidth6Chars
                             text: "删除"
-                            onClicked: Bridge.removeRemote(row.index)
+                            /*
+                             * ★ 删除是不可逆的 ★
+                             *   删的是**板子上的配对记录**（NVS）——
+                             *   删完这台就再也回不来了（映射、名字全没）。
+                             *   以前一点就删，用户以为只是从列表里移除。
+                             */
+                            onClicked: {
+                                unpairDialog.remoteIndex = row.index
+                                unpairDialog.remoteName = row.name
+                                unpairDialog.open()
+                            }
                         }
 
+                    }
+                }
+
+                /*
+                 * ★ 手机也是蓝牙设备，跟遥控器列在一起 ★
+                 *   放在已配对遥控器下方、用「手机 App」分类区分，
+                 *   一眼能看到「板子当前连了哪些蓝牙设备」。
+                 */
+                InlineSettingsRow {
+                    tokens: root.tokens
+                    objectName: "phoneInfoRow"
+                    stateColumnWidth: root.stateColumnWidth
+                    /* 和遥控器行同宽，两个按钮才不会被挤成「重..」 */
+                    titleWidth: 180
+                    actionColumnWidth: 184
+                    titleText: Bridge.phoneDisplayName
+                    descriptionText: "手机 App · "
+                        + (Bridge.phoneIdAddr.length > 0
+                            ? Bridge.phoneIdAddr
+                            : (Bridge.phoneAddr.length > 0
+                                ? Bridge.phoneAddr
+                                : "连上后显示地址"))
+                    descriptionNeverElide: true
+                    stateText: Bridge.phoneOnline ? "已连接" : "未连接"
+                    stateColor: Bridge.phoneOnline
+                        ? tokens.successColor : tokens.disabledText
+
+                    CompactButton {
+                        objectName: "renamePhone"
+                        tokens: root.tokens
+                        Layout.fillWidth: true
+                        compactMinimumWidth: root.tokens.buttonWidth6Chars
+                        text: "重命名"
+                        onClicked: {
+                            phoneNameDialog.currentName = Bridge.phoneDisplayName
+                            phoneNameDialog.open()
+                        }
+                    }
+
+                    CompactButton {
+                        objectName: "removePhone"
+                        tokens: root.tokens
+                        Layout.fillWidth: true
+                        compactMinimumWidth: root.tokens.buttonWidth6Chars
+                        text: "删除"
+                        onClicked: phoneDeleteDialog.open()
                     }
                 }
 
@@ -674,6 +805,202 @@ Item {
         onAccepted: root.firmwareFiles = Bridge.pickFirmwareFiles(selectedFiles)
     }
 
+    // ------------------------------------------------------ 扫描弹窗
+    Dialog {
+        id: scanDialog
+        objectName: "scanDialog"
+        title: "扫描附近的遥控器"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 460
+        height: 420
+        onOpened: Bridge.setScanDialogOpen(true)
+        onClosed: {
+            /* 关窗就把扫描停掉 —— 别让板子一直扫 */
+            Bridge.setScanDialogOpen(false)
+            Bridge.stopScan()
+            Bridge.closePairWindow()
+        }
+
+        background: Rectangle {
+            radius: root.tokens.cornerRadiusLarge
+            color: root.tokens.surface
+            border.color: root.tokens.border
+            border.width: root.tokens.hairlineWidth
+        }
+        header: Item { height: 0 }
+
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingSmall
+
+            Text {
+                text: "遥控器只在醒着（被按一下）的时候广播。"
+                      + "扫不出来就先按一下它的键。"
+                color: root.tokens.textSecondary
+                font.family: root.tokens.fontFamily
+                font.pixelSize: root.tokens.fontSizeBody
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+            }
+
+            ListView {
+                id: scanList
+                objectName: "scanList"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: ScanModel
+                spacing: 4
+                delegate: Item {
+                    id: cand
+                    required property int index
+                    required property string name
+                    required property string addr
+                    required property int rssi
+                    required property int addrType
+
+                    objectName: "scanCandidateRow"
+                    /*
+                     * ★ ListView 的 delegate 必须自己量宽度/高度 ★
+                     *   这里用 Layout.fillWidth / implicitHeight 是**无效**的
+                     *   （那是给 Layout 用的），结果高度算成 0、
+                     *   名字和地址叠在一起 —— 就是「信息挤成一团」。
+                     */
+                    width: ListView.view ? ListView.view.width : 0
+                    height: 56
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: root.tokens.cornerRadiusSmall
+                        color: root.tokens.surfaceMuted
+                        border.color: root.tokens.border
+                        border.width: root.tokens.hairlineWidth
+                    }
+
+                    Text {
+                        id: candName
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.right: candBtn.left
+                        anchors.rightMargin: 8
+                        anchors.top: parent.top
+                        anchors.topMargin: 8
+                        text: cand.name.length > 0 ? cand.name : "未命名设备"
+                        color: root.tokens.textPrimary
+                        font.family: root.tokens.fontFamily
+                        font.pixelSize: root.tokens.fontSizeBody
+                        font.weight: Font.Medium
+                        elide: Text.ElideRight
+                    }
+
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 10
+                        anchors.right: candBtn.left
+                        anchors.rightMargin: 8
+                        anchors.top: candName.bottom
+                        anchors.topMargin: 4
+                        text: cand.addr + "  ·  " + cand.rssi + " dBm"
+                        color: root.tokens.textSecondary
+                        font.family: root.tokens.fontFamily
+                        font.pixelSize: root.tokens.fontSizeSmall
+                        elide: Text.ElideMiddle
+                    }
+
+                    CompactButton {
+                        id: candBtn
+                        objectName: "pairCandidateButton"
+                        anchors.right: parent.right
+                        anchors.rightMargin: 8
+                        anchors.verticalCenter: parent.verticalCenter
+                        tokens: root.tokens
+                        compactMinimumWidth: root.tokens.buttonWidth4Chars
+                        text: "配对"
+                        enabled: Bridge.connected
+                        onClicked: {
+                            /*
+                             * ★ 点「配对」时**不能停扫描** ★
+                             *   板子要靠扫描抓到这台遥控器的**新鲜广播**
+                             *   才能连上（遥控器的广播地址会轮换）。
+                             *   以前这里立刻关窗 → 关窗会停扫描 →
+                             *   板子只能拿一个旧地址死连 → 「点了没反应」。
+                             *   这里只收窗，扫描继续，配对结果看状态栏。
+                             */
+                            Bridge.setScanDialogOpen(false)
+                            scanDialog.visible = false
+                            Bridge.pairCandidate(cand.addr, cand.addrType, cand.name)
+                        }
+                    }
+                }
+            }
+
+            Text {
+                objectName: "scanEmptyText"
+                visible: ScanModel.count === 0
+                text: "正在扫…还没扫到设备。"
+                      + "★遥控器只在醒着时广播★ —— 现在按一下它的任意键。"
+                color: root.tokens.textSecondary
+                font.family: root.tokens.fontFamily
+                font.pixelSize: root.tokens.fontSizeBody
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+            }
+        }
+    }
+
+    // ------------------------------------------------------ 删除确认弹窗
+    Dialog {
+        id: unpairDialog
+        objectName: "unpairDialog"
+        property int remoteIndex: -1
+        property string remoteName: ""
+
+        title: "删除这台遥控器？"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 400
+        standardButtons: Dialog.Yes | Dialog.No
+
+        background: Rectangle {
+            radius: root.tokens.cornerRadiusLarge
+            color: root.tokens.surface
+            border.color: root.tokens.border
+            border.width: root.tokens.hairlineWidth
+        }
+        header: Item { height: 0 }
+
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingSmall
+
+            Text {
+                text: "删掉的是**开发板上这台遥控器的配对记录**："
+                      + "映射、名字都会没，删完它就回不来了"
+                      + "（要再配上得重新扫描配对）。"
+                color: root.tokens.textSecondary
+                font.family: root.tokens.fontFamily
+                font.pixelSize: root.tokens.fontSizeBody
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+            }
+
+            Text {
+                text: unpairDialog.remoteName
+                color: root.tokens.textPrimary
+                font.family: root.tokens.fontFamily
+                font.pixelSize: root.tokens.fontSizeBody
+                font.weight: Font.Medium
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+            }
+        }
+
+        onAccepted: {
+            if (unpairDialog.remoteIndex >= 0) {
+                Bridge.removeRemote(unpairDialog.remoteIndex)
+            }
+        }
+    }
+
     // ------------------------------------------------------ 重命名弹窗
     Dialog {
         id: remoteNameDialog
@@ -721,6 +1048,75 @@ Item {
         onAccepted: {
             Bridge.setRemoteName(remoteNameDialog.remoteIndex,
                                  remoteNameField.text)
+        }
+    }
+
+    /* ---- 手机改名 / 删除（多台手机、发给别人用时要能区分和重配） ---- */
+    SettingsDialog {
+        id: phoneNameDialog
+        tokens: root.tokens
+        objectName: "phoneNameDialog"
+        property string currentName: ""
+
+        title: "重命名手机"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: 360
+        standardButtons: Dialog.Ok | Dialog.Cancel
+
+        background: Rectangle {
+            radius: root.tokens.cornerRadiusLarge
+            color: root.tokens.surface
+            border.color: root.tokens.border
+            border.width: root.tokens.hairlineWidth
+        }
+
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingSmall
+
+            Text {
+                text: "手机连上后会自动报出机型名（如 Xiaomi 23013RK75C）。"
+                      + "多台手机或发给别人用时，起个能分清的别名。"
+                color: root.tokens.textSecondary
+                font.family: root.tokens.fontFamily
+                font.pixelSize: root.tokens.fontSizeBody
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+            }
+
+            CompactTextField {
+                id: phoneNameField
+                objectName: "phoneNameField"
+                tokens: root.tokens
+                Layout.fillWidth: true
+                text: phoneNameDialog.currentName
+                placeholderText: "手机名字（留空恢复机型名）"
+            }
+        }
+
+        onAccepted: Bridge.renamePhone(phoneNameField.text)
+    }
+
+    SettingsDialog {
+        id: phoneDeleteDialog
+        tokens: root.tokens
+        objectName: "phoneDeleteDialog"
+        title: "断开这台手机？"
+        preferredWidth: 420
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: Bridge.deletePhone()
+
+        contentItem: Text {
+            color: root.tokens.textPrimary
+            font.family: root.tokens.fontFamily
+            font.pixelSize: root.tokens.fontSizeBody
+            wrapMode: Text.WordWrap
+            text: "会把开发板与这台手机的蓝牙连接断开，并清掉你给它起的名字。
+
+"
+                  + "手机没有「板子侧配对记录」：装了 App 的手机随时可以再连上来，"
+                  + "重新连接后可以再改名。"
         }
     }
 

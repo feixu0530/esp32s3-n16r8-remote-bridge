@@ -30,7 +30,7 @@
 #define BR_LOGBUF_MSG_MAX   96
 
 /* 环形缓冲行数 */
-#define BR_LOGBUF_LINES     256
+#define BR_LOGBUF_LINES     64
 
 /**
  * 实时推送回调。level 是 "info"/"warn"/"error"/"debug" 之类的小写词。

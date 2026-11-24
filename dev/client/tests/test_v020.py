@@ -178,8 +178,8 @@ def test_apply_defaults_takes_name() -> None:
 def test_firmware_version() -> None:
     """固件版本号必须会说实话。"""
     src = (FW_MAIN / "app_main.c").read_text(encoding="utf-8")
-    check("固件版本号是 1.0.0",
-          '#define FW_VERSION "1.0.0"' in src, "")
+    check("固件版本号是 1.2.3",
+          '#define FW_VERSION "2.0.0"' in src, "")
 
 
 def test_defaults_applied_offline() -> None:
@@ -352,7 +352,7 @@ def test_qml_dialog_and_width() -> None:
 def test_client_version() -> None:
     """客户端版本号。"""
     from core import version
-    check("客户端版本 1.0.0", version.VERSION == "1.0.0", version.VERSION)
+    check("客户端版本 1.2.3", version.VERSION == "2.0.0", version.VERSION)
 
 
 def test_local_is_master_no_compare(ctl: BridgeController) -> None:

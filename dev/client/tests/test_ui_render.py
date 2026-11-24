@@ -204,6 +204,9 @@ def main() -> int:
     pump(20)
 
     # ---- 逐页检查 ----
+    # ★ 顺序要和 main.qml 的 pages 一致 ★
+    #   设备 / 按键 / 语音 —— 「手机」独立页在 v1.2.9 取消：
+    #   手机已经是蓝牙设备，真实机型名/地址显示在设备页的「手机（…）」行。
     pages = ["设备", "按键", "语音"]
     for i, label in enumerate(pages):
         win.setProperty("currentPage", i)
@@ -315,6 +318,96 @@ def main() -> int:
                       wait_for("改名后列表按钮重建",
                                lambda: len(items_named(
                                    win.contentItem(), "renameRemote")) == 2))
+
+    # ---------------------------------------------------------- 手机布局 · 自定义键
+    print("")
+    print("[手机布局 · 自定义键]")
+    controller._cfg["remotes"] = [{
+        "addr": "50:50:50:50:50:50", "identity": "50:50:50:50:50:50",
+        "type": 0, "name": "手机（临时遥控器）", "image": "", "markers": [],
+        "kind": "phone",
+        "custom_keys": [
+            {"id": 1, "name": "截图", "col": 0, "row": 0},
+            {"id": 2, "name": "打开记事本", "col": 2, "row": 1},
+            {"id": 3, "name": "演示", "col": 1, "row": 2},
+        ],
+        "bindings": {"bindings": {}, "secondary_bindings": {}},
+    }]
+    controller.selectRemote(0)
+    win.setProperty("currentPage", 1)
+    pump(16)
+
+    canvas_bg = items_named(win.contentItem(), "phoneCanvasBg")
+    check("手机布局用绘制的快捷键页画布",
+          bool(canvas_bg) and bool(canvas_bg[0].property("visible")))
+    shots_img = items_named(win.contentItem(), "remotePhoto")
+    check("手机布局不显示遥控器实物图",
+          not shots_img or not bool(shots_img[0].property("visible")))
+
+    missing = items_named(win.contentItem(), "photoMissingHint")
+    check("手机布局不显示「实物图缺失」提示",
+          not missing or not bool(missing[0].property("visible")))
+    keycell = items_named(win.contentItem(), "mappingKeyCell_ck1")
+    check("卡片显示自定义名而不是 ck1",
+          bool(keycell) and qml_value(keycell[0], "text") == "截图",
+          str(qml_value(keycell[0], "text")) if keycell else "无卡片")
+
+    shot_keys = out_dir / "ui_phone_keys.png"
+    win.grabWindow().save(str(shot_keys))
+
+    check("手机背景图存在", bool(controller.phoneShotSource)
+          and controller.phoneShotSource.endswith("phone-shot.jpg"),
+          controller.phoneShotSource)
+    spots = controller.hotspots
+    check("自定义键热点带行列（3 个，3×N 网格）",
+          len(spots) == 3
+          and sorted((s["col"], s["row"]) for s in spots) == [(0, 0), (1, 2), (2, 1)]
+          and all(s["rows"] >= 4 for s in spots),
+          str([(s["col"], s["row"], s["rows"]) for s in spots]))
+
+    opts = controller.primaryActionOptionsFor("ck1")
+    check("自定义键的动作清单与普通键一致", len(opts) >= 10, str(len(opts)))
+
+    card, spot = settled_button("editMapping_ck1", 0)
+    check("自定义键卡片存在且坐标可点", card is not None, "找不到 editMapping_ck1")
+    if card is not None and spot is not None:
+        QTest.mouseClick(win, Qt.LeftButton, Qt.NoModifier, spot)
+        opened = wait_for(
+            "动作编辑器打开",
+            lambda: any(bool(d.property("opened"))
+                        for d in win.findChildren(QObject, "actionEditorDialog")))
+        check("点自定义键卡片能打开动作编辑器", opened)
+        if opened:
+            dlg = [d for d in win.findChildren(QObject, "actionEditorDialog")
+                   if d.property("opened")][0]
+            pump(8)
+            win.grabWindow().save(str(out_dir / "ui_phone_editor.png"))
+            combos = dlg.findChildren(QObject, "actionEditorPrimaryCombo")
+            check("编辑器能找到单击动作输入框", bool(combos))
+            if combos:
+                combos[0].setProperty("editText", "ctrl+shift+p")
+                pump(4)
+                saves = dlg.findChildren(QObject, "actionEditorSaveButton")
+                check("编辑器能找到「完成」按钮", bool(saves))
+                if saves:
+                    QMetaObject.invokeMethod(saves[0], "click")
+                    pump(10)
+            rows = [r for r in controller.buttonList if r["button_id"] == "ck1"]
+            check("自定义键的动作保存成功",
+                  bool(rows) and rows[0]["single"] == "ctrl+shift+p",
+                  rows[0]["single"] if rows else "无行")
+
+    # 拖动换位：ck1(0,0) → (2,3)，应吸附到最后一格并换到右侧
+    pump(6)
+    moved = controller.moveCustomKey("ck1", 2, 3)
+    pump(10)
+    rows = [r for r in controller.buttonList if r["button_id"] == "ck1"]
+    ck1 = next((k for k in controller.customKeys if k["button_id"] == "ck1"), None)
+    check("自定义键可移动到格点",
+          moved and bool(rows) and rows[0]["side"] == "right"
+          and ck1 is not None and (ck1["col"], ck1["row"]) == (2, 3),
+          str((rows[0] if rows else None, ck1)))
+    win.grabWindow().save(str(out_dir / "ui_phone_moved.png"))
 
     # ---- 警告 ----
     print()

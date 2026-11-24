@@ -40,6 +40,11 @@ print("=" * 70, flush=True)
 cmd = [PYTHON, os.path.join(env["IDF_PATH"], "tools", "idf.py"), "build"]
 
 try:
+    # ★ web/ 改了必须先重新嵌入 ★
+    #   br_web_assets.c 是生成后入库的源码，idf.py 不会自己重跑它 ——
+    #   漏了这步，固件里还是旧网页（改了 shim 却看不到效果）。
+    subprocess.run([PYTHON, os.path.join(HERE, "tools", "gen_web_assets.py")],
+                   env=env, check=True)
     proc = subprocess.run(cmd, env=env, timeout=900)
     print(f"\n=== exit code: {proc.returncode} ===", flush=True)
     sys.exit(proc.returncode)

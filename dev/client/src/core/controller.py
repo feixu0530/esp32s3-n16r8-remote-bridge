@@ -17,6 +17,7 @@ import os
 import threading
 import shutil
 import time
+import webbrowser
 from pathlib import Path
 from typing import Any, Optional
 
@@ -40,7 +41,8 @@ from core.pc_actions import is_pc_only, run_pc_action
 from core.protocol import ProtocolClient, escape, unescape
 from platforms import audio_player, hotkey_recorder, serial_port, text_injector
 from platforms.windows import (hid_usage_for_token, launch_command, open_uri,
-                               token_for_keyboard_usage, tokens_from_firmware)
+                               send_media_key, token_for_keyboard_usage,
+                               tokens_from_firmware)
 
 
 def _fmt_kv(kv: dict) -> str:
@@ -150,6 +152,7 @@ class RemoteListModel(QAbstractListModel):
     ImageRole = 262
     BindsRole = 263
     BindsBoardRole = 264
+    KindRole = 265
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -158,7 +161,7 @@ class RemoteListModel(QAbstractListModel):
     def roleNames(self):
         return {256: b"idx", 257: b"name", 258: b"addr", 259: b"addrType",
                 260: b"connected", 261: b"voice", 262: b"image",
-                263: b"binds", 264: b"bindsBoard"}
+                263: b"binds", 264: b"bindsBoard", 265: b"kind"}
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self._items)
@@ -177,6 +180,7 @@ class RemoteListModel(QAbstractListModel):
             262: item.get("image", ""),
             263: item.get("binds", 0),
             264: item.get("binds_board", 0),
+            265: item.get("kind", ""),
         }.get(role)
 
     # -- 变更 --
@@ -196,6 +200,21 @@ class RemoteListModel(QAbstractListModel):
           （v0.16.0 实测：下面列着 2 台，上面却写「已配对 0 台」）
         """
         return len(self._items)
+
+    @Property(int, notify=countChanged)
+    def bleCount(self) -> int:
+        """**蓝牙**遥控器台数（不含手机）。
+
+        手机是 WiFi 设备，不是蓝牙配对来的 ——
+        「蓝牙配对」里不该出现它，所以统计也要分开算。
+        """
+        return sum(1 for it in self._items if it.get("kind") != "phone")
+
+    @Property(int, notify=countChanged)
+    def bleConnectedCount(self) -> int:
+        """当前连着的蓝牙遥控器台数（不含手机）。"""
+        return sum(1 for it in self._items
+                   if it.get("kind") != "phone" and it.get("connected"))
 
     def update_item(self, row: int, **kwargs) -> None:
         if row < 0 or row >= len(self._items):
@@ -332,12 +351,17 @@ class BridgeController(QObject):
     statusChanged = Signal()
     remotesChanged = Signal()
     scanChanged = Signal()
+    wifiApsChanged = Signal()
     mappingsChanged = Signal()
+    customKeysChanged = Signal()
 
     learnChanged = Signal()
     logLine = Signal(str)
     voiceStateChanged = Signal()
     flashStateChanged = Signal()
+    wifiStateChanged = Signal()
+    phoneInfoChanged = Signal()
+    wifiNetsChanged = Signal()
     hotkeyCaptureChanged = Signal()
     logLevelChanged = Signal()
     launchAtLoginChanged = Signal()
@@ -383,6 +407,7 @@ class BridgeController(QObject):
         self._status = "未连接"
         self._connected = False
         self._scanning = False
+        self._scan_dialog_open = False
         self._pairing = False
         self._pairing_target = ""
         self._current = -1
@@ -393,6 +418,11 @@ class BridgeController(QObject):
         self._bindings: dict = {}
         self._voice_state = ""
         self._voice_text = ""
+        self._wifi_state = "off"
+        self._wifi_ip = ""
+        self._wifi_ssid = ""
+        self._wifi_why = ""     # 板子报的失败原因（人话）
+        self._wifi_nets: list = []
         self._flash_busy = False
         self._flash_port: str = ""
         self._last_voice_text: str = ""
@@ -404,11 +434,20 @@ class BridgeController(QObject):
         self._captured_hotkey = ""
         self._show_all = False
         self._scan_items: list[dict] = []
+        self._wifi_aps: list[dict] = []   # 板子扫到的周围 WiFi
+        self._wifi_picked = ""            # 扫描列表里点中的 SSID
 
         # ---- 设备页 / 日志 / 固件 ----
         self._fw_version = ""
+        # 手机的真实身份（固件 EV PHONE：设备名 + 当前地址 + 身份地址）
+        self._phone_real_name = ""
+        self._phone_conn = False
+        self._phone_addr = ""
+        self._phone_id_addr = ""
+        self._custom_keys: list[dict] = []
         self._device_present = False
         self._device_port = ""
+        self._last_port = ""   # 上次连上的口（重插后端口号通常不变）
         self._port_candidates: list[str] = []
         self._port_signature = ""
         self._port_cache: Optional[list] = None
@@ -539,6 +578,485 @@ class BridgeController(QObject):
     @Property(str, notify=voiceStateChanged)
     def voiceText(self) -> str:
         return self._voice_text
+
+    # ------------------------------------------------------ WiFi（手机接入）
+
+    @Property(str, notify=wifiStateChanged)
+    def wifiState(self) -> str:
+        """off / sta / ap"""
+        return self._wifi_state
+
+    @Property(str, notify=wifiStateChanged)
+    def wifiIp(self) -> str:
+        """板子的局域网 IP —— 手机要连的就是它"""
+        return self._wifi_ip
+
+    @Property(str, notify=wifiStateChanged)
+    def wifiSsid(self) -> str:
+        return self._wifi_ssid
+
+    @Property(str, notify=wifiStateChanged)
+    def wifiWhy(self) -> str:
+        """板子连不上网的原因（人话）。
+
+        ★ 为什么要有它 ★
+          以前界面只写「未连接」，用户完全不知道该改名字还是改密码。
+          板子报 reason=201（找不到 AP）绝大多数是**名字写错/大小写不对**
+          或**只开 5GHz**，跟密码没关系 —— 不说清楚就会一直往密码上想。
+        """
+        return self._wifi_why
+
+    @Property("QVariantList", notify=wifiNetsChanged)
+    def wifiNets(self) -> list:
+        """
+        板子记住的 WiFi 列表（每项 {idx, ssid, cur}）。
+
+        ★ 为什么要记住多个 ★
+          板子会跟着人换地方（家里 / 办公室 / 父母家）。
+          只存一条的话，每换一个地方就得插回电脑重新配一次网。
+          存一串，开机按顺序试，哪个在场连哪个。
+        """
+        return self._wifi_nets
+
+    @Property(str, notify=wifiStateChanged)
+    def phoneAddr(self) -> str:
+        """
+        手机上要填的地址 —— 只给「IP:端口」。
+
+        ★ 为什么不给完整 URL ★
+          手机 App 的输入框只认 IP:端口，粘 "http://1.2.3.4:5888" 会被判
+          「地址格式不对」。所以复制按钮给的就是这个，用户粘进去直接能用。
+        """
+        ip = self._wifi_ip or ("192.168.4.1" if self._wifi_state == "ap" else "")
+        return f"{ip}:5888" if ip else ""
+
+    @Property(str, notify=wifiStateChanged)
+    def phoneUrl(self) -> str:
+        """手机上要填的地址（板子没连上就退回热点地址）"""
+        ip = self._wifi_ip or ("192.168.4.1" if self._wifi_state == "ap" else "")
+        # ★ 明文 HTTP ★
+        #   板子改成了明文服务（局域网内不做证书那套），APK 也放开了明文，
+        #   所以这里的地址必须跟着改 —— 写成 https 的话应用连不上。
+        return f"http://{ip}:5888" if ip else ""
+
+    def _phone_entry(self) -> dict:
+        """配置里那条「手机（临时遥控器）」（kind=phone）。"""
+        for r in self._cfg.get("remotes", []):
+            if isinstance(r, dict) and r.get("kind") == "phone":
+                return r
+        return {}
+
+    # ---- 手机「自定义快捷键页」------------------------------------------
+
+    @staticmethod
+    def _clip_name(name: str) -> str:
+        """名字要放进固件的 24 字节槽：按 UTF-8 截断，别把一个汉字劈开。"""
+        raw = (name or "").replace("\\n", " ").replace("\\r", " ").replace('"', "").strip()
+        if not raw:
+            return ""
+        out, used = [], 0
+        for ch in raw:
+            n = len(ch.encode("utf-8"))
+            if used + n > 23:
+                break
+            out.append(ch)
+            used += n
+        return "".join(out)
+
+    def _load_custom_keys(self) -> None:
+        entry = self._phone_entry()
+        raw = entry.get("custom_keys", []) if isinstance(entry, dict) else []
+        out: list[dict] = []
+        used: set[int] = set()
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    kid = int(item.get("id", 0))
+                except (TypeError, ValueError):
+                    continue
+                if not (1 <= kid <= remote_layout.CUSTOM_KEY_MAX) or kid in used:
+                    continue
+                name = self._clip_name(str(item.get("name", "") or "")) or ("快捷键 %d" % kid)
+                try:
+                    col = int(item.get("col", -1))
+                except (TypeError, ValueError):
+                    col = -1
+                try:
+                    row = int(item.get("row", -1))
+                except (TypeError, ValueError):
+                    row = -1
+                used.add(kid)
+                out.append({"id": kid, "name": name, "col": col, "row": row})
+        out.sort(key=lambda x: x["id"])
+        # 坐标缺失/越界/重复的，按行优先补空格子（先到先得）
+        seen: set = set()
+        for k in out:
+            cell = (k["col"], k["row"])
+            if (0 <= k["col"] < remote_layout.CUSTOM_COLS
+                    and 0 <= k["row"] < remote_layout.CUSTOM_ROWS
+                    and cell not in seen):
+                seen.add(cell)
+                continue
+            spot = self._first_free_cell({0: c for c in seen})
+            k["col"], k["row"] = spot
+            seen.add(spot)
+        self._custom_keys = out
+
+    @staticmethod
+    def _first_free_cell(taken_map: dict, skip_id: int = 0) -> tuple:
+        taken = {v for k, v in taken_map.items() if k != skip_id}
+        for row in range(remote_layout.CUSTOM_ROWS):
+            for col in range(remote_layout.CUSTOM_COLS):
+                if (col, row) not in taken:
+                    return col, row
+        return 0, 0
+
+    def _save_custom_keys(self) -> None:
+        entry = self._phone_entry()
+        if not isinstance(entry, dict) or not entry:
+            return
+        entry["custom_keys"] = [
+            {"id": k["id"], "name": k["name"], "col": k["col"], "row": k["row"]}
+            for k in self._custom_keys
+        ]
+        cfgmod.save_config(self._cfg)
+
+    def _push_custom_keys(self) -> None:
+        """把清单对齐到板子（板子再转发给手机）。
+
+        ★ 必须逐条等 OK ★
+          一次 send 十八行，板子的串口解析跟不上，最后的 CKCOMMIT 会丢
+          （实测手机停在旧清单/空清单）。和推映射表一样，一条一条来。
+        """
+        if self._proto is None or not self._phone_entry():
+            return
+        proto = self._proto
+        keys = [(k["id"], k["col"], k["row"],
+                 str(k["name"]).replace(" ", "_")) for k in self._custom_keys]
+
+        def run() -> None:
+            try:
+                r = proto.request("CKBEGIN", len(keys), timeout=2.0)
+                if not r.ok:
+                    self.log.warning("CKBEGIN 失败: %s", r.raw)
+                    return
+                for kid, col, row, name in keys:
+                    r = proto.request("CKADD", kid, col, row, name, timeout=2.0)
+                    if not r.ok:
+                        self.log.warning("CKADD %s 失败: %s", kid, r.raw)
+                        return
+                r = proto.request("CKCOMMIT", timeout=3.0)
+                if not r.ok:
+                    self.log.warning("CKCOMMIT 失败: %s", r.raw)
+            except Exception as exc:
+                self.log.debug("推送自定义键失败: %s", exc)
+
+        threading.Thread(target=run, name="push-ckeys", daemon=True).start()
+
+    @Property("QVariantList", notify=customKeysChanged)
+    def customKeys(self) -> list:
+        return [{"id": k["id"], "name": k["name"],
+                 "col": k["col"], "row": k["row"],
+                 "button_id": remote_layout.custom_button_id(k["id"]),
+                 "key_id": remote_layout.custom_key_id(k["id"])}
+                for k in self._custom_keys]
+
+    @Slot(result=int)
+    def addCustomKey(self) -> int:
+        used = {k["id"] for k in self._custom_keys}
+        free = next((i for i in range(1, remote_layout.CUSTOM_KEY_MAX + 1)
+                     if i not in used), 0)
+        if not free:
+            self._set_status("自定义快捷键已满（最多 12 个）")
+            return 0
+        taken = {k["id"]: (k["col"], k["row"]) for k in self._custom_keys}
+        col, row = self._first_free_cell(taken)
+        self._custom_keys.append({"id": free, "name": "快捷键 %d" % free,
+                                  "col": col, "row": row})
+        self._custom_keys.sort(key=lambda x: x["id"])
+        self._save_custom_keys()
+        self._push_custom_keys()
+        self._load_mappings()
+        self.customKeysChanged.emit()
+        self._set_status("已添加快捷键，请在右侧给它配动作")
+        return free
+
+    @Slot(str, result=bool)
+    def removeCustomKey(self, button_id: str) -> bool:
+        if not isinstance(button_id, str) or not button_id.startswith("ck"):
+            return False
+        try:
+            kid = int(button_id[2:])
+        except ValueError:
+            return False
+        before = len(self._custom_keys)
+        self._custom_keys = [k for k in self._custom_keys if k["id"] != kid]
+        if len(self._custom_keys) == before:
+            return False
+        key_id = remote_layout.custom_key_id(kid)
+        self._bindings = clear_button_action(self._bindings, key_id,
+                                             ButtonTrigger.SINGLE_CLICK)
+        self._save_custom_keys()
+        self._save_bindings()
+        self._push_custom_keys()
+        self._load_mappings()
+        self.customKeysChanged.emit()
+        return True
+
+    @Slot(str, int, int, result=bool)
+    def moveCustomKey(self, button_id: str, col: int, row: int) -> bool:
+        """把自定义键拖到某个格点；目标格有别的键就交换位置。"""
+        if not isinstance(button_id, str) or not button_id.startswith("ck"):
+            return False
+        if not (0 <= col < remote_layout.CUSTOM_COLS
+                and 0 <= row < remote_layout.CUSTOM_ROWS):
+            return False
+        try:
+            kid = int(button_id[2:])
+        except ValueError:
+            return False
+        me = next((k for k in self._custom_keys if k["id"] == kid), None)
+        if me is None or (me["col"] == col and me["row"] == row):
+            return False
+        other = next((k for k in self._custom_keys
+                      if k is not me and k["col"] == col and k["row"] == row), None)
+        ocol, orow = me["col"], me["row"]
+        me["col"], me["row"] = col, row
+        if other is not None:
+            other["col"], other["row"] = ocol, orow
+        self._save_custom_keys()
+        self._push_custom_keys()
+        self._load_mappings()
+        self.customKeysChanged.emit()
+        return True
+
+    @Slot(str, str, result=bool)
+    def renameCustomKey(self, button_id: str, name: str) -> bool:
+        if not isinstance(button_id, str) or not button_id.startswith("ck"):
+            return False
+        try:
+            kid = int(button_id[2:])
+        except ValueError:
+            return False
+        clean = self._clip_name(name)
+        if not clean:
+            return False
+        for k in self._custom_keys:
+            if k["id"] == kid:
+                k["name"] = clean
+                break
+        else:
+            return False
+        self._save_custom_keys()
+        self._push_custom_keys()
+        self._load_mappings()
+        self.customKeysChanged.emit()
+        return True
+
+    @Property("QVariantList", notify=mappingsChanged)
+    def hotspots(self) -> list:
+        """
+        实物图上的热区。
+
+        谷歌遥控器：固定档案里的 15 个键；
+        手机：没有实物图，改用「自定义键在截图里的格点」——
+        与 buttonList **同序**，连线和选中才能一一对上。
+        """
+        if self._remote_kind() != remote_layout.LAYOUT_PHONE:
+            return [{"button_id": h.button_id, "x": h.x, "y": h.y,
+                     "width": h.width, "height": h.height,
+                     "is_voice": h.is_voice, "custom": False, "visible": True}
+                    for h in remote_layout.CHROMECAST_HOTSPOTS]
+
+        # 手机布局的行数随内容增长（滚屏）；坐标交给 QML 按像素画，
+        # 这里只给 col/row/rows，避免「限量 12 个」时的固定 3×4 假设。
+        rows = max(4, max((int(k.get("row", 0)) for k in self._custom_keys), default=0) + 1)
+        out = []
+        for ck in self._custom_keys:
+            out.append({"button_id": remote_layout.custom_button_id(ck["id"]),
+                        "col": int(ck["col"]), "row": int(ck["row"]),
+                        "rows": rows, "x": 0, "y": 0, "width": 0, "height": 0,
+                        "is_voice": False, "custom": True, "visible": True})
+        return out
+
+    @Property(str, constant=True)
+    def phoneShotSource(self) -> str:
+        """手机快捷键页截图（作背景）。随包资源，取不到就返回空。"""
+        from core.resources import assets_dir
+        p = assets_dir() / "remotes" / "phone-shot.jpg"
+        return p.resolve().as_uri() if p.is_file() else ""
+
+    @Property(str, notify=remotesChanged)
+    def remoteKind(self) -> str:
+        """当前选中遥控器的布局（chromecast / phone），给 QML 做条件渲染。"""
+        return self._remote_kind()
+
+    @Property(bool, notify=remotesChanged)
+    def phoneOnline(self) -> bool:
+        """
+        手机现在连着没有。
+
+        ★ 手机是 WiFi 设备 ★
+          板子按手机最近有没有发过心跳来报（固件 br_phone_recently_active）。
+          它不是蓝牙配对来的，所以「蓝牙配对」列表里不该有它 ——
+          手机单独一个页面，那儿显示它的真实状态。
+        """
+        # 蓝牙链路的真实状态优先（EV PHONE 的 conn），退回旧的伪条目状态
+        if self._phone_addr or self._phone_real_name:
+            return self._phone_conn
+        return bool(self._phone_entry().get("connected", False))
+
+    @Property(int, notify=remotesChanged)
+    def phoneBinds(self) -> int:
+        """手机上配的按键映射条数。"""
+        return int(self._phone_entry().get("binds", 0) or 0)
+
+    @Property(str, notify=remotesChanged)
+    def phoneName(self) -> str:
+        """手机这一台的显示名（优先用蓝牙读到的真实设备名）。"""
+        if self._phone_real_name:
+            return self._phone_real_name
+        name = str(self._phone_entry().get("name", "") or "")
+        return name or "手机（临时遥控器）"
+
+    @Property(str, notify=phoneInfoChanged)
+    def phoneAddr(self) -> str:
+        """手机当前的蓝牙地址（可能是轮换的随机地址）。"""
+        return self._phone_addr
+
+    @Property(str, notify=phoneInfoChanged)
+    def phoneIdAddr(self) -> str:
+        """手机的身份地址（配对后固定；空 = 还没拿到）。"""
+        return self._phone_id_addr
+
+    @Property(str, notify=phoneInfoChanged)
+    def phoneRealName(self) -> str:
+        """手机蓝牙设备名（GATT 0x2A00）。"""
+        return self._phone_real_name
+
+    def _phone_key(self) -> str:
+        """
+        手机在配置里的键：**蓝牙 MAC 地址**（优先身份地址）。
+
+        ★ 注意 ★
+          Android 默认给外设的是会轮换的随机地址（RPA），
+          没做绑定时重连可能换一个 —— 名字会跟着丢。
+          想彻底固定，需要板子和手机做一次 BLE 绑定（bond），
+          拿到 identity address 后就稳定了。
+        """
+        return self._phone_id_addr or self._phone_addr
+
+    @Property(str, notify=phoneInfoChanged)
+    def phoneDisplayName(self) -> str:
+        """设备列表里显示的手机名：用户改过的 > 真实机型名 > 「手机」。"""
+        key = self._phone_key()
+        names = self._cfg.get("phone_names", {})
+        if key and isinstance(names, dict) and names.get(key):
+            return str(names[key])
+        return self._phone_real_name or "手机"
+
+    @Slot(str)
+    def renamePhone(self, name: str) -> None:
+        """
+        给手机起名字（多台手机/发给别人用时区分用）。
+
+        存在 phone_names[地址] 里 —— 地址拿不到（还没连过）就只提示。
+        """
+        key = self._phone_key()
+        if not key:
+            self._set_status("手机还没连上，先连一次再改名")
+            return
+        clean = name.strip()[:40]
+        names = dict(self._cfg.get("phone_names", {}) or {})
+        if clean:
+            names[key] = clean
+        else:
+            names.pop(key, None)
+        self._cfg["phone_names"] = names
+        cfgmod.save_config(self._cfg)
+        self.phoneInfoChanged.emit()
+        self.remotesChanged.emit()
+        self._set_status(f"已把这台手机命名为 {clean}" if clean else "已清除自定义名字")
+
+    @Slot()
+    def deletePhone(self) -> None:
+        """
+        删除这台手机：清掉自定义名字，并让板子断开它的蓝牙链路。
+
+        手机没有「板子侧配对记录」（任何装了 App 的手机都能连），
+        所以这里的「删除」= 记下这次的名字不要了 + 立刻断开，
+        手机端下次连上就是一台「新」设备，可以重新命名。
+        """
+        key = self._phone_key()
+        names = dict(self._cfg.get("phone_names", {}) or {})
+        if key and key in names:
+            names.pop(key, None)
+            self._cfg["phone_names"] = names
+            cfgmod.save_config(self._cfg)
+        if self._proto is not None:
+            # 不仅要断开，还要让板子记住「别再接受这台」，否则手机会立刻抢回来
+            self._proto.send("PHONEFORGET")
+        self._phone_real_name = ""
+        self._phone_conn = False
+        self.phoneInfoChanged.emit()
+        self.remotesChanged.emit()
+        self._set_status("已断开这台手机；它重新连上后可以再改名")
+
+    @Slot(str, str)
+    def setWifi(self, ssid: str, password: str) -> None:
+        """
+        给开发板配网。
+
+        ★ 为什么要从 PC 配 ★
+          板子插在电脑上，PC 走 USB CDC 下发凭据最直接 ——
+          不用让用户先连板子的热点再去网页里填。
+        """
+        ssid = (ssid or "").strip()
+        if not ssid:
+            self._set_status("请先填 WiFi 名称")
+            return
+        self._set_status(f"正在让开发板连接 {ssid} …")
+
+        def _done(_r):
+            self._set_status(f"已下发 {ssid}，等板子连上")
+            self.refreshWifiNets()
+
+        self._ask("WIFI", f"SSID={escape(ssid)}",
+                  f"PASS={escape(password or '')}", timeout=6.0, on_ok=_done)
+
+    @Slot()
+    def refreshWifi(self) -> None:
+        """问板子当前的 WiFi 状态"""
+        self._ask("WIFIINFO", timeout=4.0,
+                  on_ok=lambda _r: self._set_status("已查询开发板 WiFi 状态"))
+
+    @Slot()
+    def refreshWifiNets(self) -> None:
+        """问板子记住了哪些 WiFi（DT WIFINET 逐行回来）"""
+        self._ask("WIFILIST", timeout=4.0)
+
+    @Slot(int)
+    def deleteWifiNet(self, idx: int) -> None:
+        """删掉板子记住的第 idx 个 WiFi（板子会把新列表报回来）"""
+        if idx < 0:
+            return
+        self._ask("WIFIDEL", f"IDX={idx}", timeout=4.0,
+                  on_ok=lambda _r: self._set_status("已删掉一个记住的 WiFi"))
+
+    @Slot(str)
+    def copyToClipboard(self, text: str) -> None:
+        """把一段文字放进系统剪贴板（手机上要填的地址等）"""
+        text = text or ""
+        if not text:
+            self._set_status("没有可复制的内容")
+            return
+        try:
+            QGuiApplication.clipboard().setText(text)
+            self._set_status(f"已复制：{text}")
+        except Exception as exc:
+            self._set_status(f"复制失败：{exc}")
 
     @Property(bool, notify=settingsChanged)
     def voiceEnabled(self) -> bool:
@@ -779,6 +1297,9 @@ class BridgeController(QObject):
                 self._set_status(f"打开 {device} 失败：{exc}")
             return False
         self._port_busy = False
+        # ★ 记住这次连的是哪个口 ★
+        #   板子拔了再插上来，端口号通常还是它 —— 重连时优先用它。
+        self._last_port = device
 
         self._proto = ProtocolClient(self._port)
         self._proto.on_event(self._on_event)
@@ -816,13 +1337,34 @@ class BridgeController(QObject):
         #   不主动问的话页面永远显示「未知」。
         self.refreshDeviceInfo()
         self.refreshRemotes()
+        # ★ 连上就问板子的 WiFi 状态与 IP ★
+        #   手机端要填的就是这个 IP（用户在路由器里未必认得出哪台是 ESP32）。
+        #   以前只在页面可见时问，客户端自己连上板子时压根没问过 →
+        #   「手机地址」永远是空的。
+        self.refreshWifi()
+        self.refreshWifiNets()
         return True
 
     @Slot()
     def disconnectDevice(self) -> None:
-        self._auto_connect = False     # 用户主动断开，不再自动重连
-        if self._port_timer is not None:
-            self._port_timer.stop()
+        """用户主动断开。"""
+        self._disconnect(user_initiated=True)
+
+    def _disconnect(self, user_initiated: bool = True) -> None:
+        """
+        断开协议通道。
+
+        ★ user_initiated=False = 「板子被拔了」★
+          这条路**不能停轮询定时器** ——
+          定时器停了，就再没人去发现板子插回来了，
+          客户端会一直停在「未连接」，
+          拔一次板子就必须把客户端重启一遍（实测：真会这样）。
+          轮询定时器是「找板子」的心跳，只有关客户端退出时才该停。
+        """
+        if user_initiated:
+            self._auto_connect = False     # 用户主动断开，不再自动重连
+            if self._port_timer is not None:
+                self._port_timer.stop()
         if self._proto is not None:
             # 兼容旧固件：新固件断开配置串口后仍应自主运行。
             try:
@@ -946,6 +1488,25 @@ class BridgeController(QObject):
         self.scanChanged.emit()
         self._set_status("正在扫描遥控器…")
 
+    @Property(bool, notify=scanChanged)
+    def scanDialogOpen(self) -> bool:
+        """扫描弹窗是否开着（界面上显示「扫描中」）。"""
+        return self._scan_dialog_open
+
+    @Slot(bool)
+    def setScanDialogOpen(self, on: bool) -> None:
+        self._scan_dialog_open = bool(on)
+        self.scanChanged.emit()
+
+    @Slot()
+    def closePairWindow(self) -> None:
+        """关掉板子的配对窗口（顺带停掉它的自动扫描）。"""
+        if self._proto is None:
+            return
+        self._proto.send("PAIRWINDOW", 0)
+        self._pair_window_until = 0.0
+        self.pairWindowChanged.emit()
+
     @Slot()
     def stopScan(self) -> None:
         if self._proto is None:
@@ -954,6 +1515,48 @@ class BridgeController(QObject):
         self._scanning = False
         self.scanChanged.emit()
         self._set_status("已停止扫描")
+
+    @Property("QVariantList", notify=wifiApsChanged)
+    def wifiAps(self) -> list:
+        """
+        板子扫到的周围 WiFi（名字 + 信号 + 信道）。
+
+        ★ 为什么必须由板子来扫 ★
+          ESP32-S3 只支持 2.4 GHz。路由器常常同时开着两个名字
+          （"CMCC-7K5j-5G" 与 "CMCC-7K5j"），手机/PC 上看着能连的那个
+          若是 5 GHz 的，板子根本看不见；
+          而且 **SSID 大小写也必须完全一致**（实测用户把
+          "CMCC-7K5j" 打成 "CMCC-7k5j"，板子一直 reason=201 找不到）。
+          让用户从「板子自己看得见的列表」里点，这一整类坑就绕开了。
+        """
+        return list(self._wifi_aps)
+
+    @Property(str, notify=wifiApsChanged)
+    def wifiPicked(self) -> str:
+        """用户在扫描列表里点中的那个 SSID。"""
+        return self._wifi_picked
+
+    @Slot()
+    def scanWifi(self) -> None:
+        """让板子扫一遍周围的 WiFi（扫完板子会自己恢复连接）。"""
+        if self._proto is None:
+            self._set_status("未连接设备")
+            return
+        self._wifi_aps = []
+        self.wifiApsChanged.emit()
+        self._set_status("正在让开发板扫描周围的 WiFi…")
+        self._ask("WIFISCAN", timeout=8.0, on_ok=self._on_wifi_scan_done)
+
+    def _on_wifi_scan_done(self, _result) -> None:
+        self._set_status(f"扫到 {len(self._wifi_aps)} 个 WiFi，"
+                         "点一下名字就能填进上面的框")
+
+    @Slot(str)
+    def useWifiAp(self, ssid: str) -> None:
+        """把扫到的 SSID 填进「开发板 WiFi」那一栏（用户再补密码）。"""
+        self._wifi_picked = ssid
+        self.wifiApsChanged.emit()
+        self._set_status(f"已选中 {ssid}，填上密码后点「连接」")
 
     @Slot(str, int, str, result=bool)
     def pairCandidate(self, addr: str, addr_type: int, name: str) -> bool:
@@ -1113,6 +1716,10 @@ class BridgeController(QObject):
         if idx < 0:
             idx = 0
         self._current = idx
+        # ★ 选中变化后必须重建按键行 ★
+        #   初始化时 _current=-1，_load_mappings 会按 Chromecast 兜底生成一整套谷歌键；
+        #   这里只改 _current 不重建的话，手机 tab 会一直显示谷歌键（首屏串台）。
+        self._load_mappings()
         self.remotesChanged.emit()
 
     def _apply_board_mapping(self, result, addr: str) -> None:
@@ -1418,13 +2025,24 @@ class BridgeController(QObject):
         按固定档案生成按键页的行。
 
         每一行 = 一个物理键，三格分别是单击 / 双击 / 长按的动作。
+
+        ★ 按布局取 ★
+          谷歌遥控器一套键位，手机（临时遥控器）另一套 ——
+          两者 key_id 前缀不同（2: 与 6:），映射互不覆盖。
         """
+        kind = self._remote_kind()
         self._bindings = self._remote_bindings(self._current)
+        self._load_custom_keys()
         items = []
-        for button_id in remote_layout.BUTTON_ORDER:
-            key_id = remote_layout.button_key_id(button_id)
-            is_voice = remote_layout.is_voice_button(button_id)
-            side = "right" if button_id in remote_layout.RIGHT_BUTTON_IDS else "left"
+        # 手机布局：卡片只放用户添加的自定义键；esc/音量/静音 仍在触控板页，
+        # 有自己的出厂动作，不在这张表里重复出现。
+        fixed_ids = (() if kind == remote_layout.LAYOUT_PHONE
+                     else remote_layout.button_order_for(kind))
+        for button_id in fixed_ids:
+            key_id = remote_layout.button_key_id_for(kind, button_id)
+            is_voice = remote_layout.is_voice_button_for(kind, button_id)
+            side = ("right" if button_id in remote_layout.right_button_ids_for(kind)
+                    else "left")
             if is_voice:
                 # 语音键不走 HID，它由 ATVV 控制通道驱动，映射在语音页配
                 single = self._voice_key_label()
@@ -1436,7 +2054,7 @@ class BridgeController(QObject):
                 long = self._action_text(key_id, ButtonTrigger.LONG_PRESS)
             items.append({
                 "button_id": button_id,
-                "button_name": remote_layout.display_name(button_id),
+                "button_name": remote_layout.display_name_for(kind, button_id),
                 "key_id": key_id,
                 "single": single,
                 "double": double,
@@ -1447,14 +2065,71 @@ class BridgeController(QObject):
                                             ButtonTrigger.DOUBLE_CLICK),
                 "long_note": display_note(self._bindings, key_id,
                                           ButtonTrigger.LONG_PRESS),
-                "short_name": remote_layout.short_name(button_id),
+                "short_name": remote_layout.short_name_for(kind, button_id),
                 "is_voice": is_voice,
-                "visual_row": remote_layout.visual_row(button_id),
+                "visual_row": remote_layout.visual_row_for(kind, button_id),
                 "side": side,
             })
+        if kind == remote_layout.LAYOUT_PHONE:
+            # 卡片左右分行：按 (row, col) 排序后**每侧各自计数**，
+            # 否则 col0 与 col1（偶数行也算左）会落在同一个视觉行、互相遮住。
+            left_row = right_row = 0
+            ordered = sorted(self._custom_keys,
+                             key=lambda k: (int(k.get("row", 0)),
+                                            int(k.get("col", 0))))
+            for idx, ck in enumerate(ordered):
+                kid = int(ck["id"])
+                col = int(ck.get("col", 0))
+                side = ("left" if col == 0
+                        else "right" if col == 2
+                        else ("left" if int(ck.get("row", 0)) % 2 == 0 else "right"))
+                if side == "left":
+                    row_for_card = left_row
+                    left_row += 1
+                else:
+                    row_for_card = right_row
+                    right_row += 1
+                key_id = remote_layout.custom_key_id(kid)
+                items.append({
+                    "button_id": remote_layout.custom_button_id(kid),
+                    "button_name": str(ck.get("name") or ("快捷键 %d" % kid)),
+                    "key_id": key_id,
+                    "single": self._action_text(key_id, ButtonTrigger.SINGLE_CLICK),
+                    "double": "",
+                    "long": "",
+                    "single_note": "",
+                    "double_note": "",
+                    "long_note": "",
+                    "short_name": str(ck.get("name") or ("快捷键 %d" % kid))[:4],
+                    "is_voice": False,
+                    "visual_row": row_for_card,
+                    "side": side,
+                })
         self._button_items = items
         self.mappingModel.set_items(items)
         self.mappingsChanged.emit()
+
+    def _remote_kind(self, addr: str = "") -> str:
+        """
+        这个遥控器属于哪套布局（谷歌遥控器 / 手机）。
+
+        ★ 为什么要按布局分开 ★
+          手机是「临时遥控器」，键位和谷歌遥控器完全不同；
+          而且两边的 key_id 空间必须隔离（2: 与 6:），
+          否则手机上按一下会把遥控器的映射改掉。
+        """
+        remotes = self._cfg.get("remotes", [])
+        if addr:
+            for entry in remotes:
+                if isinstance(entry, dict) and addr in (
+                        str(entry.get("addr", "") or ""),
+                        str(entry.get("identity", "") or "")):
+                    return remote_layout.layout_kind_for_remote(entry)
+            return remote_layout.LAYOUT_CHROMECAST
+        if 0 <= self._current < len(remotes):
+            return remote_layout.layout_kind_for_remote(remotes[self._current])
+        return remote_layout.LAYOUT_CHROMECAST
+
     def _remote_bindings(self, idx: int) -> dict:
         remotes = self._cfg.get("remotes", [])
         if 0 <= idx < len(remotes) and isinstance(remotes[idx], dict):
@@ -1472,11 +2147,12 @@ class BridgeController(QObject):
           打开按键页就有完整的一列键可配。
         """
         out: dict[str, str] = {}
-        for button_id in remote_layout.BUTTON_ORDER:
-            key_id = remote_layout.button_key_id(button_id)
+        kind = self._remote_kind()
+        for button_id in remote_layout.button_order_for(kind):
+            key_id = remote_layout.button_key_id_for(kind, button_id)
             if not key_id:
                 continue          # 语音键没有 HID usage
-            out[key_id] = remote_layout.display_name(button_id)
+            out[key_id] = remote_layout.display_name_for(kind, button_id)
         return out
     def _action_text(self, key_id: str, trigger: ButtonTrigger) -> str:
         action = button_action_for(self._bindings, key_id, trigger)
@@ -2473,18 +3149,6 @@ class BridgeController(QObject):
         self._set_status("已恢复型号默认并写回开发板（保留备注与双击/长按）")
         return True
 
-    @Property("QVariantList", notify=mappingsChanged)
-    def hotspots(self) -> list:
-        """
-        实物图上 15 个按键热点的归一化坐标（0..1）。
-
-        坐标是照抄参考项目的，跟随包那张固定档案图 —— 图和坐标必须配套。
-        """
-        return [{"button_id": h.button_id, "x": h.x, "y": h.y,
-                 "width": h.width, "height": h.height,
-                 "is_voice": h.is_voice}
-                for h in remote_layout.CHROMECAST_HOTSPOTS]
-
     @Property(str, notify=closeBehaviorChanged)
     def closeBehavior(self) -> str:
         """hide = 关闭窗口时隐藏到任务栏；quit = 完全退出。"""
@@ -2576,19 +3240,27 @@ class BridgeController(QObject):
         # ---- 热插拔：板子拔了要断，插上要自动连 ----
         if self._connected and self._device_port not in ports:
             self.log.info("开发板被拔出，断开串口")
-            self.disconnectDevice()
+            # ★ 不能走 disconnectDevice() ★
+            #   那条路会把轮询定时器也停掉 —— 板子插回来就没人发现了，
+            #   客户端会一直停在「未连接」（拔一次板子就得重启客户端）。
+            self._disconnect(user_initiated=False)
             self._auto_connect = True      # 拔了不算用户主动断开，插回来要自动连
-            self._set_status("开发板已拔出")
+            self._set_status("开发板已拔出，插回来会自动重连")
             return
         # 自动重连要退避：端口被别的程序占着时，
         # 每 2 秒重试一次会把日志刷爆（v0.15.0 实测刷了几十条 ERROR）。
-        if not self._connected and len(ports) == 1 and self._auto_connect:
+        # ★ 不要求「只有一个口」 ★
+        #   插着别的 ESP32-S3 时端口会变多，原来 len(ports)==1 的条件
+        #   一旦不成立就永远不重连了 —— 板子插回来也没用。
+        if not self._connected and ports and self._auto_connect:
             now = time.monotonic()
             if self._last_connect_try and now - self._last_connect_try < self._reconnect_backoff:
                 return
             self._last_connect_try = now
-            self.log.info("发现开发板 %s，自动连接", ports[0])
-            if self.connectDevice(ports[0]):
+            # 优先连上次那个口（重插后端口号通常不变，变了就退而求其次）
+            target = self._last_port if self._last_port in ports else ports[0]
+            self.log.info("发现开发板 %s，自动连接", target)
+            if self.connectDevice(target):
                 self._reconnect_backoff = 0.0
             else:
                 self._reconnect_backoff = min(
@@ -2638,6 +3310,8 @@ class BridgeController(QObject):
         if version != self._fw_version:
             self._fw_version = version
             self.deviceInfoChanged.emit()
+        # 手机端「快捷键页」的清单以 PC 配置为准，连上就对齐一次
+        self._push_custom_keys()
 
     def _ask(self, verb: str, *args, timeout: float = 4.0, on_ok=None) -> None:
         """
@@ -2816,6 +3490,17 @@ class BridgeController(QObject):
         self._scan_items = []
         self._rebuild_scan_model()
 
+    def _explain_wifi_fail(self, why: str) -> str:
+        """板子扫描失败的原因翻译成人话。"""
+        why = (why or "").strip()
+        return {
+            "none": "一个 WiFi 都没扫到 —— 开发板只支持 2.4GHz，"
+                    "确认路由器开着 2.4GHz",
+            "start": "扫描没能启动",
+            "get": "扫描结果取不出来",
+            "nomem": "内存不够",
+        }.get(why, why or "未知原因")
+
     def _set_status(self, text: str) -> None:
         self._status = text
         self.statusChanged.emit()
@@ -2905,6 +3590,12 @@ class BridgeController(QObject):
             else:
                 self._scan_items.append(item)
             self._rebuild_scan_model()
+        elif name == "PAIRTARGET":
+            # 板子自动抓到一台，开始连了 —— 告诉用户是哪一台
+            who = kv.get("name", "") or kv.get("addr", "")
+            self._pairing_target = who
+            self.pairingChanged.emit()
+            self._set_status(f"正在配对 {who}（板子已经抓到了）…")
         elif name == "CONN":
             self._set_status(f"已连接 {kv.get('name') or kv.get('addr')}")
             self.refreshRemotes()
@@ -2961,8 +3652,15 @@ class BridgeController(QObject):
                 #   持续扫描既费电又和重连抢控制器。
                 if self._proto is not None:
                     self._proto.send("SCAN", 0)
+                    # ★ 配对窗口也关掉 ★
+                    #   不关的话板子会继续扫，PC 的候选列表一直有东西在冒，
+                    #   用户看着像「板子一直在扫描，停不下来」。
+                    self._proto.send("PAIRWINDOW", 0)
                 self._scanning = False
+                self._scan_dialog_open = False
+                self._pair_window_until = 0.0
                 self.scanChanged.emit()
+                self.pairWindowChanged.emit()
             else:
                 self._set_status("配对失败：" + self._explain_pair_fail(
                     unescape(kv.get("why", "")) or ""))
@@ -2972,6 +3670,113 @@ class BridgeController(QObject):
             self.refreshRemotes()
         elif name == "ATVVREADY":
             self._set_status("ATVV 语音通道就绪")
+        elif name == "PHONE":
+            self._phone_real_name = unescape(kv.get("name", ""))
+            self._phone_addr = kv.get("addr", "")
+            self._phone_id_addr = kv.get("id", "")
+            self._phone_conn = kv.get("conn", "0") == "1"
+            self.phoneInfoChanged.emit()
+            self.remotesChanged.emit()
+        elif name == "TEXT":
+            self._on_phone_text(kv)
+        elif name == "WIFI":
+            self._on_wifi_state(kv)
+        elif name == "SYSACT":
+            self._on_phone_sysact(kv)
+
+    # ------------------------------------------------------- 手机（移动端）
+    def _on_phone_text(self, kv: dict) -> None:
+        """
+        手机发来的文本 → 注入到当前焦点输入框。
+
+        ★ 为什么文本要绕一圈回 PC ★
+          USB HID 键盘只能发按键码，打不出中文/emoji。
+          板子上没有剪贴板，只有 PC 有 → 文本必须回 PC 落地。
+        """
+        text = unescape(kv.get("text", ""))
+        if not text:
+            return
+        if text_injector is None:
+            self.log.warning("手机文本无法注入：平台没有文本注入器")
+            self._set_status("手机文本无法注入：当前平台没有文本注入器")
+            return
+        # ★ 注入结果必须留痕 ★
+        #   以前只在状态栏闪一下，出问题时完全看不出「文本到没到、注入成没成」。
+        ok = False
+        try:
+            ok = bool(text_injector.inject_text(text))
+        except Exception as exc:
+            self.log.error("文本注入异常: %s", exc)
+        self.log.info("手机文本 %r 注入%s", text, "成功" if ok else "失败")
+        if ok:
+            self._set_status(f"已输入 {len(text)} 个字符")
+        else:
+            self._set_status("文本注入失败")
+
+    def _on_phone_sysact(self, kv: dict) -> None:
+        """
+        手机端请求的 PC 专属动作。
+
+        ★ 手机键盘页最上面那排功能键全走这里 ★
+          音量-/音量+/静音/终端/关机 —— 以前这里只认 open_url，
+          其它一律回「暂不支持」，所以那排键按了毫无反应。
+        """
+        action = unescape(kv.get("action", ""))
+        url = unescape(kv.get("url", ""))
+        if action == "open_url" and url:
+            try:
+                webbrowser.open(url)
+                self._set_status(f"已打开 {url}")
+            except Exception as exc:
+                self._set_status(f"打开失败：{exc}")
+            return
+
+        if action in ("vol_up", "vol_down", "mute"):
+            ok = send_media_key(action)
+            label = {"vol_up": "音量 +", "vol_down": "音量 -",
+                     "mute": "静音"}[action]
+            self._set_status((label if ok else f"{label} 失败"))
+            return
+
+        if action == "terminal":
+            exe = (shutil.which("wt.exe") or shutil.which("wt")
+                   or shutil.which("cmd.exe"))
+            if not exe:
+                self._set_status("找不到终端程序")
+                return
+            launch_command([exe])
+            self._set_status("已打开终端")
+            return
+
+        if action == "shutdown":
+            # 给 60 秒缓冲：手机上误按长按不至于立刻断电，
+            # 要取消就在电脑上跑 shutdown /a。
+            launch_command(["shutdown", "/s", "/t", "60"])
+            self._set_status("60 秒后关机（取消：shutdown /a）")
+            return
+
+        self._set_status(f"手机动作 {action} 暂不支持")
+
+    def _on_wifi_state(self, kv: dict) -> None:
+        """
+        板子的 WiFi 状态。
+
+        板子连上路由器后把自己的 IP 报上来 —— 手机要连的就是这个 IP
+        （IDF 6.1 没有 mDNS 组件，没法用 xxx.local 这种名字）。
+        """
+        state = kv.get("state", "off")
+        ip = kv.get("ip", "")
+        ssid = unescape(kv.get("ssid", ""))
+        why = unescape(kv.get("why", ""))
+        self._wifi_state = state
+        self._wifi_ip = ip
+        self._wifi_ssid = ssid
+        self._wifi_why = "" if state == "sta" else why
+        self.wifiStateChanged.emit()
+        if state == "sta" and ip:
+            self._set_status(f"开发板已连 WiFi（{ssid}），手机访问 http://{ip}:5888")
+        elif state == "ap":
+            self._set_status("开发板未配网，已开启热点，手机连 ESP32-Remote-XXXX 后访问 http://192.168.4.1:5888")
 
     @staticmethod
     def _explain_pair_fail(why: str) -> str:
@@ -3008,6 +3813,34 @@ class BridgeController(QObject):
             text = human_log.board_log(level, tag, msg)
             self.logLine.emit(text)
             self._append_log(text)
+        elif kind == "WIFINET":
+            self._on_wifi_net_row(kv)
+        elif kind == "WIFIAP":
+            # 板子扫到的周围 WiFi
+            self._wifi_aps.append({
+                "ssid": kv.get("ssid", ""),
+                "rssi": int(kv.get("rssi", 0) or 0),
+                "chan": int(kv.get("chan", 0) or 0),
+                "auth": int(kv.get("auth", 0) or 0),
+            })
+            self.wifiApsChanged.emit()
+
+    def _on_wifi_net_row(self, kv: dict) -> None:
+        """
+        板子记住的一个 WiFi。
+
+        固件按 idx 0..n-1 顺序逐行报 —— 见到 idx=0 就是新一轮列表的开始，
+        这样 WIFILIST 和 WIFIDEL（删完自动重报）都能正确整体替换。
+        """
+        idx = int(kv.get("idx", 0) or 0)
+        if idx == 0:
+            self._wifi_nets = []
+        self._wifi_nets.append({
+            "idx": idx,
+            "ssid": unescape(kv.get("ssid", "")),
+            "cur": kv.get("cur", "0") == "1",
+        })
+        self.wifiNetsChanged.emit()
 
     def _rebuild_remote_model(self) -> None:
         """按当前配置重建遥控器列表。"""
@@ -3067,6 +3900,15 @@ class BridgeController(QObject):
                  #   的真实值。两个数摆在一起，用户一眼能看出
                  #   「板子上还没同步」还是「已经同步好了」。
                  "binds_board": int(kv.get("binds", 0) or 0)}
+        # ★ 布局种类 ★
+        #   板子把手机报上来时带 kind=phone —— PC 端据此用「手机」那套
+        #   键位（usage 空间 6:），而不是谷歌遥控器那套（2:）。
+        #   没带 kind 的老设备一律当谷歌遥控器。
+        kind_str = str(kv.get("kind", "") or "")
+        if kind_str:
+            entry["kind"] = kind_str
+        elif old.get("kind"):
+            entry["kind"] = old["kind"]
         custom = str(old.get("custom_name", "") or "")
         if custom:
             # 用户自己起的名字优先，广播名（一堆 HID_Device）只当兜底
@@ -3138,7 +3980,14 @@ class BridgeController(QObject):
 
     # ------------------------------------------------- 人话日志
     def _remote_label(self, addr: str = "") -> str:
-        """遥控器的人话名字（名字 + 地址）。"""
+        """遥控器的人话名字（名字 + 地址）。
+
+        ★ 手机用的是固件里的虚拟地址 50:50:…，映射表靠它隔离；
+          但日志里必须写手机真正的蓝牙地址，否则和「设备」页对不上。★
+        """
+        if addr == remote_layout.BR_PHONE_ADDR:
+            real = self._phone_id_addr or self._phone_addr
+            return human_log.who(self.phoneDisplayName, real or addr)
         name = ""
         for i in range(self.remoteModel.rowCount()):
             r = self.remoteModel.get(i)
@@ -3167,6 +4016,12 @@ class BridgeController(QObject):
         for usage_i2, button_id in remote_layout.usage_to_button_id().items():
             if key_id == f"{remote_layout.BR_SRC_CONSUMER}:{usage_i2}":
                 return remote_layout.display_name(button_id)
+        # 手机（临时遥控器）的语义键
+        for usage_i2, button_id in remote_layout.usage_to_button_id_for(
+                remote_layout.LAYOUT_PHONE).items():
+            if key_id == f"{remote_layout.BR_SRC_PHONE}:{usage_i2}":
+                return remote_layout.display_name_for(
+                    remote_layout.LAYOUT_PHONE, button_id)
         if src_i == 1:          # 键盘页才用键盘键名
             name = token_for_keyboard_usage(usage_i)
             if name:
@@ -3275,7 +4130,15 @@ class BridgeController(QObject):
         button_id = ""
         if src == remote_layout.BR_SRC_CONSUMER:
             button_id = remote_layout.usage_to_button_id().get(usage, "")
-        if button_id:
+        elif src == remote_layout.BR_SRC_PHONE:
+            kid = remote_layout.custom_id_of_usage(usage)
+            if kid:
+                button_id = remote_layout.custom_button_id(kid)
+        if button_id and src == remote_layout.BR_SRC_PHONE:
+            ck = next((k for k in self._custom_keys if k["id"] == kid), None)
+            key_name = str(ck["name"]) if ck else f"自定义键 {kid}"
+            self.setSelectedButtonId(button_id)
+        elif button_id:
             key_name = remote_layout.display_name(button_id)
             self.setSelectedButtonId(button_id)
         else:
@@ -3319,13 +4182,24 @@ class BridgeController(QObject):
         except (TypeError, ValueError):
             return
         if src != remote_layout.BR_SRC_CONSUMER:
-            return
-        button_id = remote_layout.usage_to_button_id().get(usage, "")
+            # ★ 手机（临时遥控器）的键也要能配 PC 专属动作 ★
+            #   以前这里写死「只认消费者页」，src=6 的手机事件被直接丢掉 ——
+            #   结果手机上按快捷键，PC 端一点反应都没有。
+            if src != remote_layout.BR_SRC_PHONE:
+                return
+            src_kind = remote_layout.LAYOUT_PHONE
+        else:
+            src_kind = remote_layout.LAYOUT_CHROMECAST
+        button_id = remote_layout.usage_to_button_id_for(src_kind).get(usage, "")
+        if not button_id and src_kind == remote_layout.LAYOUT_PHONE:
+            kid = remote_layout.custom_id_of_usage(usage)
+            if kid:
+                button_id = remote_layout.custom_button_id(kid)
         if not button_id:
             return
-        # ★ 绑定字典的键是 key_id（"2:120"），不是 "netflix" ★
+        # ★ 绑定字典的键是 key_id（"2:120" / "6:2"），不是 "netflix" ★
         #   按按钮 id 去查永远查不到 —— 这就是「下拉里选了、按了没反应」的根因。
-        key_id = remote_layout.button_key_id(button_id)
+        key_id = remote_layout.button_key_id_for(src_kind, button_id)
         if not key_id:
             return
         addr = str(kv.get("addr", "") or "")

@@ -32,6 +32,10 @@ AbstractButton {
     property bool voiceAction: false
     property bool exposeObjectNames: true
 
+    /* 自定义键的就地管理：点名字改名、右键删除 */
+    signal renameRequested(string cardId)
+    signal deleteRequested(string cardId)
+
     hoverEnabled: true
     implicitHeight: 49
     leftPadding: 4
@@ -40,6 +44,11 @@ AbstractButton {
     bottomPadding: 3
     objectName: exposeObjectNames ? "editMapping_" + cardId : ""
     Accessible.name: buttonName + qsTr("按键映射")
+
+    TapHandler {
+        acceptedButtons: Qt.RightButton
+        onTapped: root.deleteRequested(root.cardId)
+    }
 
     /* 动作名的简写，跟参考项目一致 */
     function displayBinding(text) {
@@ -218,6 +227,7 @@ AbstractButton {
         columnSpacing: 4
 
         MappingKeyLabel {
+            id: keyLabel
             objectName: root.exposeObjectNames
                 ? "mappingKeyCell_" + root.cardId : ""
             tokens: root.tokens
@@ -229,6 +239,14 @@ AbstractButton {
             Accessible.name: text
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
+
+            MouseArea {
+                objectName: root.exposeObjectNames
+                    ? "mappingKeyName_" + root.cardId : ""
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton
+                onClicked: root.renameRequested(root.cardId)
+            }
         }
 
         GridLayout {

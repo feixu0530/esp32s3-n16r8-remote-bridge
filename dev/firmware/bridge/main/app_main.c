@@ -15,6 +15,7 @@
 
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <nvs_flash.h>
@@ -22,18 +23,38 @@
 #include "br_types.h"
 #include "br_proto.h"
 #include "br_ble_core.h"
+#include "br_ble_gatt.h"
 #include "br_hid.h"
 #include "br_mapping.h"
+#include "br_ckeys.h"
 #include "br_usb.h"
 #include "br_led.h"
 #include "br_uart.h"
 #include "br_voice.h"
 #include "br_gesture.h"
 #include "br_logbuf.h"
+#include "br_json_min.h"
+#include "br_phone.h"
+#include "br_wifi.h"
+#include "br_web.h"
 
 static const char *TAG = "app";
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "2.0.0"
+
+/*
+ * ★ 链路选择（本轮架构调整的核心）★
+ *   1 = 旧方案：手机连板子的 WiFi + HTTPS 页面
+ *   0 = 新方案：手机走 BLE（GATT），板子完全不开 WiFi
+ *
+ *   为什么默认 0：ESP32-S3 的 WiFi 与 BLE 共用一根天线。
+ *   WiFi 常开 + 遥控器/手机多条 BLE 链路时，射频被抢，
+ *   手机链路实测每 5 秒就掉一次（HCI status=8 连接超时），
+ *   表现为「用着用着就不响应」。BLE 独占射频后彻底消失。
+ */
+#ifndef BR_LINK_WIFI
+#define BR_LINK_WIFI 0
+#endif
 
 /* ------------------------------------------------------------------ 输出 */
 
@@ -61,6 +82,9 @@ static void cmd_info(void)
     br_kv_add_int(&kv, "conn", br_ble_connected_count());
     br_kv_add_int(&kv, "cands", br_ble_candidate_count());
     br_proto_send_ok("INFO", &kv);
+    /* 客户端连上就问 INFO —— 顺手把手机身份补报一次，
+       否则它错过连接瞬间那条 EV PHONE，界面上永远是空的。 */
+    br_ble_gatt_report_phone();
 }
 
 /**
@@ -246,6 +270,39 @@ static void handle_command(const char *line)
             return;
         }
 
+    } else if (strcmp(verb, "CKBEGIN") == 0) {
+        long n = 0;
+        if (!br_proto_arg_int(&p, 1, &n) || !br_ckeys_begin((int)n)) {
+            br_proto_send_err("CKBEGIN", "args", NULL);
+        } else {
+            br_proto_send_ok("CKBEGIN", NULL);
+        }
+
+    } else if (strcmp(verb, "CKADD") == 0) {
+        /* CKADD <id> <col> <row> <name>；老格式 CKADD <id> <name> 也继续认 */
+        long id = 0, col = 0, row = 0;
+        const char *nm = "";
+        bool ok = br_proto_arg_int(&p, 1, &id);
+        if (ok && argc >= 5) {
+            ok = br_proto_arg_int(&p, 2, &col) && br_proto_arg_int(&p, 3, &row);
+            nm = p.argv[4];
+        } else if (ok) {
+            nm = argc > 2 ? p.argv[2] : "";
+        }
+        if (!ok || !br_ckeys_add((int)id, (int)col, (int)row, nm)) {
+            br_proto_send_err("CKADD", "args", NULL);
+        } else {
+            br_proto_send_ok("CKADD", NULL);
+        }
+
+    } else if (strcmp(verb, "CKCOMMIT") == 0) {
+        if (!br_ckeys_commit()) {
+            br_proto_send_err("CKCOMMIT", "nvs", NULL);
+        } else {
+            br_proto_send_ok("CKCOMMIT", NULL);
+            br_ckeys_report();
+        }
+
     } else if (strcmp(verb, "VOICEKEY") == 0) {
         /*
          * 不带参数 = 读回当前语音快捷键；
@@ -403,6 +460,100 @@ static void handle_command(const char *line)
         vTaskDelay(pdMS_TO_TICKS(100));
         esp_restart();
 
+    } else if (strcmp(verb, "PHONEFORGET") == 0) {
+        /* PC 删除手机：断开 + 拉黑，除非重新开配对窗口否则不再接受 */
+        br_ble_gatt_forget_phone();
+        br_proto_send_ok("PHONEFORGET", NULL);
+
+    } else if (strcmp(verb, "PHONDROP") == 0) {
+        /* PC 端点「删除这台手机」：断开手机链路（手机端会自动重连） */
+        br_ble_gatt_drop_phone();
+        br_proto_send_ok("PHONDROP", NULL);
+
+    } else if (strcmp(verb, "WIFI") == 0) {
+#if !BR_LINK_WIFI
+        /* WiFi 链路已关（手机走 BLE）—— 别让客户端以为配网失败，直接说清楚 */
+        br_proto_send_err("WIFI", "disabled", NULL);
+#else
+        /*
+         * WIFI SSID=xxx PASS=yyy —— PC 客户端给板子配网。
+         *
+         * 板子把凭据存进 NVS 并连接，连上后用 EV WIFI 把 IP 上报，
+         * PC 客户端显示给用户（手机要连的就是这个 IP ——
+         * IDF 6.1 没有 mDNS 组件，没法用 xxx.local）。
+         */
+        const char *ssid = NULL;
+        char ssid_buf[64] = {0};
+        char pass_buf[64] = {0};
+        for (int i = 1; i < argc; i++) {
+            if (strncmp(p.argv[i], "SSID=", 5) == 0) {
+                br_proto_unescape(ssid_buf, sizeof(ssid_buf), p.argv[i] + 5);
+                ssid = ssid_buf;
+            } else if (strncmp(p.argv[i], "PASS=", 5) == 0) {
+                br_proto_unescape(pass_buf, sizeof(pass_buf), p.argv[i] + 5);
+            }
+        }
+        if (!ssid || !*ssid) {
+            br_proto_send_err("WIFI", "ssid", NULL);
+            return;
+        }
+        if (br_wifi_set_credentials(ssid, pass_buf)) {
+            br_proto_send_ok("WIFI", NULL);
+        } else {
+            br_proto_send_err("WIFI", "start", NULL);
+        }
+
+#endif
+    } else if (strcmp(verb, "WIFIINFO") == 0) {
+#if !BR_LINK_WIFI
+        {
+            br_kv_t kv;
+            br_kv_init(&kv);
+            br_kv_add(&kv, "state", "off");
+            br_kv_add(&kv, "ip", "");
+            br_kv_add(&kv, "ssid", "");
+            br_kv_add(&kv, "why", "wifi-disabled");
+            br_proto_send_ev("WIFI", &kv);
+        }
+#else
+        /* 查询当前 WiFi 状态与 IP */
+        br_wifi_report();
+
+#endif
+    } else if (strcmp(verb, "WIFISCAN") == 0) {
+#if !BR_LINK_WIFI
+        br_proto_send_ok("WIFISCAN", NULL);
+#else
+        /* 扫描附近 AP（板子只能看见 2.4GHz 的），结果以 DT WIFIAP 逐行上报 */
+        br_wifi_scan();
+
+#endif
+    } else if (strcmp(verb, "WIFILIST") == 0) {
+#if !BR_LINK_WIFI
+        br_proto_send_ok("WIFILIST", NULL);
+#else
+        /* 板子记住的 WiFi 列表（DT WIFINET 逐行 + OK WIFILIST） */
+        br_wifi_list_nets();
+
+#endif
+    } else if (strcmp(verb, "WIFIDEL") == 0) {
+#if !BR_LINK_WIFI
+        br_proto_send_err("WIFIDEL", "disabled", NULL);
+#else
+        /* WIFIDEL IDX=n —— 删掉第 n 个记住的网络，删完把新列表报回来 */
+        int idx = -1;
+        for (int i = 1; i < argc; i++) {
+            if (strncmp(p.argv[i], "IDX=", 4) == 0) {
+                idx = atoi(p.argv[i] + 4);
+            }
+        }
+        if (br_wifi_delete_net(idx)) {
+            br_wifi_list_nets();
+        } else {
+            br_proto_send_err("WIFIDEL", "idx", NULL);
+        }
+
+#endif
     } else {
         br_proto_send_err(verb, "unknown", NULL);
     }
@@ -410,10 +561,17 @@ static void handle_command(const char *line)
 
 /* ------------------------------------------------------------ CDC 任务 */
 
+static TaskHandle_t s_cdc_task = NULL;
+
 static void cdc_task(void *arg)
 {
     (void)arg;
-    char line[BR_LINE_MAX];
+    /* ★ 512B 的行缓冲放静态区 ★
+       这个任务的栈要跑 handle_command 的整条调用链（REMOTES 会遍历
+       配对表 + 候选表 + 绑定表），已经吃满 8KB ——
+       再压一个 512B 的帧就直接溢出重启过（实测：发 REMOTES 板子重启，
+       PC 端表现为「连上以后再也收不到任何数据」）。 */
+    static char line[BR_LINE_MAX];
 
     for (;;) {
         if (bridge_usb_read_line(line, sizeof(line), 20)) {
@@ -439,6 +597,37 @@ static void log_live_sink(const char *level, const char *tag, const char *msg)
     br_proto_send_lg(level, line);
 }
 
+/*
+ * 堆占用巡检。
+ *
+ * 板子只有 512KB 内部 RAM，BLE + WiFi + TLS 挤在一起。
+ * 关键不是「剩多少」，而是「最大的连续块还有多大」——
+ * 碎片化会让连续块远小于剩余总量，TLS 握手要的就是连续块。
+ */
+static void heap_watch_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        /*
+         * 只在「内存开始不够」时才出声 —— 正常时刷屏没意义，
+         * 出问题时日志里能直接看到连续块还剩多少。
+         */
+        uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        if (largest < 16384) {
+            /* cdc 任务的栈余量也一起打出来：它以前在 REMOTES 上溢过一次，
+               重启前只有 panic 一行，事后完全看不出是哪条任务吃满的。 */
+            UBaseType_t cdc_hw = s_cdc_task ? uxTaskGetStackHighWaterMark(s_cdc_task) : 0;
+            ESP_LOGW(TAG, "[heap] 内部 RAM %u，最大连续块 %u，PSRAM %u，总堆 %u，cdc栈余 %u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)largest,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)(cdc_hw * sizeof(StackType_t)));
+        }
+    }
+}
+
 void app_main(void)
 {
     /*
@@ -454,6 +643,16 @@ void app_main(void)
      */
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
     esp_log_level_set("bt", ESP_LOG_WARN);
+    /* TLS 相关的日志开 DEBUG —— HTTPS 起不来时只有这里能看到真正原因 */
+    esp_log_level_set("esp_https_server", ESP_LOG_DEBUG);
+    esp_log_level_set("httpd", ESP_LOG_WARN);
+    esp_log_level_set("httpd_sess", ESP_LOG_WARN);
+    esp_log_level_set("tcp_transport", ESP_LOG_WARN);
+    /* 浏览器把 keep-alive 连接关掉时 httpd 会报一次 recv 错 —— 无害，
+       但每条都是一个警告，刷起来很吵。 */
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("esp-tls", ESP_LOG_DEBUG);
+    esp_log_level_set("mbedtls", ESP_LOG_WARN);
 
     ESP_LOGI(TAG, "ESP32-S3 Remote Bridge %s", FW_VERSION);
 
@@ -473,6 +672,7 @@ void app_main(void)
     br_logbuf_init();
 
     br_mapping_init();
+    br_ckeys_init();
 
     /* USB 复合设备 */
     ESP_ERROR_CHECK(bridge_usb_init());
@@ -482,6 +682,24 @@ void app_main(void)
     /* 协议层 */
     br_proto_init(usb_write);
 
+    /*
+     * ★ CDC 命令任务必须在这里建（WiFi 起来之前）★
+     *
+     * 这条任务要跑 handle_command 的整条调用链：
+     *   REMOTES → br_ble_list_remotes()（配对表 + 候选表 + 绑定表）
+     * 栈需求实测超过 8KB。以前在 WiFi/HTTPS 之后创建，那时内部 RAM
+     * 只剩 ~10KB，只能退到 4KB 栈 → 一发 REMOTES 就 **stack overflow
+     * 重启**，PC 端看到的是「连上后立刻静默、USB 设备消失」。
+     *
+     * 现在提前到 WiFi 之前建（此时内部 RAM 还有 ~140KB），给足 16KB。
+     */
+    if (xTaskCreate(cdc_task, "cdc", 16384, NULL, 4, &s_cdc_task) != pdPASS) {
+        ESP_LOGE(TAG, "cdc task create failed at 16KB, retry 8KB");
+        if (xTaskCreate(cdc_task, "cdc", 8192, NULL, 4, &s_cdc_task) != pdPASS) {
+            ESP_LOGE(TAG, "cdc task create failed even at 8KB");
+        }
+    }
+
     /* 板端日志实时推送给 PC（限流在 br_logbuf 里做） */
     br_logbuf_set_sink(log_live_sink);
 
@@ -490,15 +708,55 @@ void app_main(void)
     xTaskCreate(bridge_led_task, "led", 3072, NULL, 3, NULL);
 
     /* BLE */
+    ESP_LOGI(TAG, "BLE 前：总堆 %u，内部 RAM %u，最大连续块 %u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     ESP_ERROR_CHECK(br_ble_init());
+    ESP_LOGI(TAG, "BLE 后：总堆 %u，内部 RAM %u，最大连续块 %u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
-    /* CDC 命令任务 */
     /*
-     * cdc 任务帧里有 char line[512]，再叠上 handle_command 的
-     * br_parsed_t + br_kv_t，6144 也就刚够；给足余量，
-     * 免得再出现 uart_rx 那种「发条命令就重启」。
+     * 手机端（WiFi + HTTPS）
+     *
+     * 顺序很讲究：
+     *   1) 先起 WiFi（STA）—— 没有凭据时自动降级开热点
+     *   2) 再起 HTTPS —— 手机要访问的是这个地址
+     *   3) 手机事件翻译层
+     *
+     * ★ 与 BLE 的关系 ★
+     *   板子同时是 BLE central（连 Chromecast 遥控器）与 WiFi STA。
+     *   ESP32-S3 单射频，两者共用 —— WiFi 发射会遮蔽 BLE 接收。
+     *   这是本设计最大的硬件风险（详见计划书），要靠实机压测验证。
      */
-    xTaskCreate(cdc_task, "cdc", 8192, NULL, 4, NULL);
+    br_phone_init();
+
+#if BR_LINK_WIFI
+    /* ★ 回退开关 ★ 手机走 BLE 以后不再需要 WiFi；
+       真要回到「手机连板子 WiFi」的老方案，把 BR_LINK_WIFI 改成 1 重新编译。
+       两个链路在下位机里是可以同时跑的，但射频只有一根：
+       WiFi + 全速 BLE 扫描会让手机链路每几秒就 supervision timeout 掉一次。 */
+    br_wifi_init();
+    br_web_start();
+#else
+    ESP_LOGI(TAG, "BLE 模式：不启动 WiFi / HTTP（手机直连蓝牙）");
+#endif
+
+    /*
+     * 手机快捷键的出厂默认映射。
+     * 用户配过就绝不覆盖（br_mapping_apply_phone_defaults 自己判）。
+     */
+    br_mapping_apply_phone_defaults();
+
+    /*
+     * ★ 堆占用巡检（定位 TLS 握手内存不足用）★
+     *   板子只有 512KB 内部 RAM，BLE + WiFi + TLS 一起用非常紧。
+     *   握手失败时要从这里看「内部 RAM 还剩多少、最大连续块多大」——
+     *   碎片化会让最大的连续块远小于剩余总量。
+     */
+    xTaskCreate(heap_watch_task, "heap", 3072, NULL, 1, NULL);
 
     /* UART0 走同一套命令（调试备份通道） */
     br_uart_set_line_handler(handle_command);

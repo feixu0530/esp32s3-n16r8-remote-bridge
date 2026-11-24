@@ -101,6 +101,14 @@ bool br_ble_peer_char_at(int peer_idx, int i, br_chr_info_t *out);
  */
 void br_ble_set_auto(bool on);
 void br_ble_set_auto_dump(bool on);
+
+/**
+ * WiFi 优先模式。
+ *
+ * ESP32-S3 单天线，BLE 扫描会打断 WiFi 的 4 次握手（reason=201）。
+ * WiFi 连接期间打开它，暂停自动扫描；连上后关闭，恢复扫描。
+ */
+void br_ble_set_wifi_priority(bool on);
 /** 目标名字子串（NULL=不限） */
 void br_ble_set_target_name(const char *substr);
 
@@ -143,6 +151,12 @@ bool br_ble_unpair(int rem_idx);
  * 数据源是 NVS 配对表，不是 BLE bond 表。
  */
 int br_ble_list_remotes(void);
+
+/** 手机刚发过事件 —— 暂停 BLE 扫描几秒，把射频让给 WiFi */
+void br_ble_note_phone_activity(void);
+
+/** 手机是否正在占用板子（扫描要不要让路） */
+bool br_ble_phone_busy(void);
 
 /**
  * ★ 唯一的「地址字符串 -> NimBLE 字节序」入口 ★

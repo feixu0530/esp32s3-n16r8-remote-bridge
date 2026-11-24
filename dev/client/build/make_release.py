@@ -64,7 +64,7 @@ def copy_firmware(outdir: Path, version: str) -> None:
 def copy_phone_apk(outdir: Path, version: str) -> None:
     """把改好的手机端 APK 一起放进发布目录。
 
-    应用是照抄 movo 的，只改了图标、应用名与「允许明文 HTTP」。
+    应用基于 movo 改写（见 THIRD_PARTY.md），现名 Fremote。
     连同签名用的 keystore 一起给出去 —— 以后重打包还得用它，
     换密钥签名的话手机上就得先卸载。
     """
@@ -72,11 +72,16 @@ def copy_phone_apk(outdir: Path, version: str) -> None:
     if not src_dir:
         print("  （跳过 APK：设置 MOTO_APK_DIR 后再跑）")
         return
-    for name in ("Movo-%s.apk" % version, "movo.keystore"):
+    wanted = ("Fremote-%s.apk" % version, "Movo-%s.apk" % version, "movo.keystore")
+    for name in wanted:
         src = src_dir / name
-        if src.exists():
-            shutil.copy2(src, outdir / name)
-            print("  复制 %s" % name)
+        if not src.exists():
+            continue
+        dst = outdir / name
+        if name.startswith("Movo-"):
+            dst = outdir / ("Fremote-" + name.split("-", 1)[1])
+        shutil.copy2(src, dst)
+        print("  复制 %s" % dst.name)
 
 
 def zip_win64(outdir: Path, version: str) -> Path:

@@ -8,7 +8,7 @@
     4. zipalign + apksigner 签名
 
 用法：
-    python dev/apk/build_apk.py --out C:/tmp/Movo-1.2.4-ble.apk
+    python dev/apk/build_apk.py --out C:/tmp/Fremote-1.2.4.apk
     python dev/apk/build_apk.py --src C:/tmp/apkdec3 --apktool C:/path/apktool.jar
 
 依赖（本机路径，可用参数覆盖）：

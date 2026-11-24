@@ -12,9 +12,9 @@
     var D = {
         zh: {
             /* ---------- 通用 ---------- */
-            'app.title.pad': 'ESP32 遥控 | 触控板',
-            'app.title.kb': 'ESP32 遥控 | 键盘',
-            'app.title.cp': 'ESP32 遥控 | Code',
+            'app.title.pad': 'Fremote | 触控板',
+            'app.title.kb': 'Fremote | 键盘',
+            'app.title.cp': 'Fremote | Code',
             'conn.offline': '未连接 · 点此刷新',
             'conn.sleep': '已休眠 · 轻触屏幕唤醒',
             'conn.waking': '正在连接…',
@@ -49,7 +49,7 @@
             'pad.mode.pad': '触摸板',
             'pad.mode.gyro': '陀螺仪',
             'pad.mode.shortcut': '快捷键',
-            'app.title.ck': 'Movo | 快捷键',
+            'app.title.ck': 'Fremote | 快捷键',
             'ck.title': '快捷键',
             'ck.hint': '由电脑端「按键」页管理',
             'ck.empty': '还没有自定义键，到电脑端「按键」页添加',
@@ -170,9 +170,9 @@
         },
 
         en: {
-            'app.title.pad': 'Movo | Touchpad',
-            'app.title.kb': 'Movo | Keyboard',
-            'app.title.cp': 'ESP32 遥控 | Code',
+            'app.title.pad': 'Fremote | Touchpad',
+            'app.title.kb': 'Fremote | Keyboard',
+            'app.title.cp': 'Fremote | Code',
             'conn.offline': 'Disconnected · tap to refresh',
             'conn.sleep': 'Asleep · tap to wake',
             'conn.waking': 'Connecting…',
@@ -206,7 +206,7 @@
             'pad.mode.pad': 'Touchpad',
             'pad.mode.gyro': 'Gyro',
             'pad.mode.shortcut': 'Shortcuts',
-            'app.title.ck': 'Movo | Shortcuts',
+            'app.title.ck': 'Fremote | Shortcuts',
             'ck.title': 'Shortcuts',
             'ck.hint': 'Managed on the PC app (Keys page)',
             'ck.empty': 'No custom keys yet — add them on the PC app (Keys page)',
@@ -227,7 +227,7 @@
             'pad.toast.nopc': 'Can\'t reach your PC',
             'pad.mic.perm': 'Microphone permission denied',
             'pad.mic.unavailable': 'Microphone unavailable',
-            'pad.mic.hint': 'Allow the microphone in Settings → Apps → Movo → Permissions',
+            'pad.mic.hint': 'Allow the microphone in Settings → Apps → Fremote → Permissions',
             'pad.mic.nodata': 'No audio received',
             'pad.stt.loading': 'Speech engine is still loading, one moment',
             'pad.stt.loading.short': 'Speech engine loading, about 5s',

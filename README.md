@@ -35,7 +35,7 @@
    - 遥控器：长按 `Home` 键约 3 秒（指示灯闪烁，进入配对模式）
    - 软件：点「进入配对模式」
    - 两边同时进行，配对成功后设备页显示遥控器名字和 MAC
-4. **手机 App**：安装 `Movo-2.0.0.apk` → 首次打开进设置页 →「扫描」→ 点 `remote-bridge`
+4. **手机 App**：安装 `Fremote-2.0.0.apk` → 首次打开进设置页 →「扫描」→ 点 `remote-bridge`
 5. **按键页**：给每个键配动作（单击 / 双击 / 长按）
    - 改完**立即自动同步到板子**，不需要点保存
    - 支持组合键，例如 `ctrl+shift+p`、`lwin+d`、`,`（标点直接录）
@@ -49,6 +49,19 @@
 ---
 
 ## 3. 烧录 / 升级固件
+
+### 该刷哪个文件？（只有两种情况）
+
+GitHub Release 里**只有一个固件** `remote_bridge-2.0.0.bin`，它就是应用固件，直接刷它即可：
+
+| 场景 | 选择文件 | 写入地址 | 数据是否保留 |
+|---|---|---|---|
+| **日常升级**（1.x → 2.0.0，或以后的 2.0.x） | `remote_bridge-2.0.0.bin` | `0x10000`（应用区） | 配对表、按键映射、语音快捷键**全部保留** |
+| **首次刷写 / 换板子 / 板子变砖** | 不用单独下载任何东西：绿色包内 `_internal/firmware/` 已带全三个文件 | `0x0` + `0x8000` + `0x10000` | 会清空板内配置，需要重新配对 |
+
+- 日常升级**不要**刷 bootloader / 分区表，也不需要它们；它们只随绿色包提供，
+  由客户端「烧录」按钮自动按地址写入。
+- 旧 WiFi 回退版固件已停用，不再发布。
 
 ### ⚠️ 先看清楚：烧录需要**两根数据线**
 
@@ -67,10 +80,11 @@
 ### 方式一：软件内刷写（推荐）
 
 1. 设备页 → 刷写固件 → 烧录通道选 `COMx — 烧录通道`（板载 CH343）
-2. 「选固件」→ 选中 `firmware/remote_bridge-2.0.0.bin`
+2. 「选固件」→ 选中 `remote_bridge-2.0.0.bin`（Release 里唯一的 bin）
 3. 点：
-   - **仅应用**：只写应用区（`0x10000`），配对表 / 按键映射 / 语音快捷键**全部保留**
-   - **烧录**：bootloader + 分区表 + 应用一起写（换固件大版本时用）
+   - **仅应用**（日常升级就点这个）：只写应用区 `0x10000`，配对表 / 按键映射 / 语音快捷键**全部保留**
+   - **烧录**（首次/救砖）：使用绿色包内置的 bootloader + 分区表 + 应用，
+     依次写 `0x0` / `0x8000` / `0x10000`，会清空板内配置
 
 绿色包**已内置 esptool**，不需要安装 ESP-IDF 或 Python。
 
@@ -90,25 +104,27 @@ esptool --chip esp32s3 --port COM6 -b 460800 --before default-reset --after hard
 
 ---
 
-## 4. 目录说明（本发布包）
+## 4. Release 文件说明
+
+GitHub Release 只放下面这几项，**固件只有一个 bin**：
 
 ```
-2.0.0/
-├─ ESP32S3RemoteBridge/                    绿色版客户端（解压即用）
-├─ ESP32S3RemoteBridge-2.0.0-win64.zip     绿色版客户端压缩包
-├─ ESP32S3-all-remote-2.0.0-src.zip        完整源代码
-├─ Movo-2.0.0.apk                          手机 App
-├─ firmware/                                BLE 版固件（bootloader/分区表/应用）
-├─ firmware-wifi/                           WiFi 回退版固件
-├─ README.md  docs/USER_MANUAL.md  LICENSE  THIRD_PARTY.md
-└─ SHA256SUMS.txt                          校验和（sha256sum -c 可自检）
+ESP32S3RemoteBridge-2.0.0-win64.zip     Windows 绿色版（解压即用）
+ESP32S3-all-remote-2.0.0-src.zip        完整源代码
+Fremote-2.0.0.apk                       手机 App
+remote_bridge-2.0.0.bin                 应用固件（日常升级只刷它，0x10000）
+MANUAL-2.0.0-zh.md                      使用手册
+SHA256SUMS.txt                          以上文件的 SHA256（sha256sum -c 自检）
 ```
+
+解压绿色包后，`_internal/firmware/` 里还有 bootloader / 分区表 / 应用三件套，
+只在客户端「烧录」全量写入时使用，**不需要单独下载**。
 
 ---
 
 ## 5. 手机 App（v2.0.0 新增）
 
-手机通过 **BLE 直连板子**（不连板子 WiFi），装上 `Movo-2.0.0.apk` 即可当：
+手机通过 **BLE 直连板子**（不连板子 WiFi），装上 `Fremote-2.0.0.apk` 即可当：
 
 - **触控板**：移动、轻点左键、双指滚动/缩放、侧边滚轮条，灵敏度/左右手可调
 - **陀螺仪空鼠**：手机当空中鼠标，左右两块为左右键，可调灵敏度
@@ -152,8 +168,10 @@ esptool --chip esp32s3 --port COM6 -b 460800 --before default-reset --after hard
 
 以及它们各自的上游 [nijez/open-voice-bridge](https://github.com/nijez/open-voice-bridge)。
 
-手机 App 的 WebView 页面与交互原型来自 **movo**（Android WebView 遥控端），
-本项目重写了页面并改为 BLE 直连；
+手机 App 的 WebView 页面与交互原型来自开源项目 **movo**
+（[https://github.com/dsnaaa/movo](https://github.com/dsnaaa/movo)，Android WebView 遥控端），
+本项目在其 APK 基础上改写页面并改为 BLE 直连，App 名称也由 movo 改为 **Fremote**；
+原项目的作者与贡献者保留全部署名，许可见 `THIRD_PARTY.md`。
 另感谢 **乐鑫 ESP-IDF / NimBLE / TinyUSB**、**Qt / PySide6**、**sherpa-onnx / onnxruntime**
 与所有开源组件（许可见 `THIRD_PARTY.md`）。
 

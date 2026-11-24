@@ -4,7 +4,7 @@ movo 的安卓壳（WebView + 原生桥）没有源码，只有反编译出来�
 这里的做法是：**新代码全部用 Java 写、javac+d8 编成 `classes4.dex` 塞进 APK**，
 smali 只动两处最小的地方（各一行/一小段），避免手写 smali 带来的 `VerifyError`。
 
-产物：`releases/<版本>/Movo-<版本>-ble.apk`
+产物：`releases/<版本>/Fremote-<版本>.apk`
 
 ---
 
@@ -94,7 +94,7 @@ goto :goto_1
 ## 6. 构建
 
 ```bash
-python dev/apk/build_apk.py --src C:/tmp/apkdec3 --out C:/tmp/Movo-1.2.4-ble.apk
+python dev/apk/build_apk.py --src C:/tmp/apkdec3 --out C:/tmp/Fremote-1.2.4.apk
 ```
 
 脚本做四件事：`javac+d8` 出 dex → `apktool b` → 把 dex 以 `classes4.dex`

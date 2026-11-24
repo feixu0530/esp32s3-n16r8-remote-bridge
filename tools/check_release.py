@@ -82,13 +82,16 @@ def main() -> int:
     fw = rel / "firmware" / "remote_bridge.bin"
     wf = rel / "firmware-wifi" / "remote_bridge.bin"
     check("BLE 固件与 build/ 同哈希", fw.is_file() and fw.read_bytes() == (FW_BUILD / "remote_bridge.bin").read_bytes())
-    check("WiFi 固件与 build_wifi/ 同哈希", wf.is_file() and wf.read_bytes() == (FW_WIFI / "remote_bridge.bin").read_bytes())
     tail = ver.encode()
     check("BLE 固件含版本字符串", fw.is_file() and tail in fw.read_bytes())
-    check("WiFi 固件含版本字符串", wf.is_file() and tail in wf.read_bytes())
+    if wf.is_file():
+        check("WiFi 固件与 build_wifi/ 同哈希", wf.read_bytes() == (FW_WIFI / "remote_bridge.bin").read_bytes())
+        check("WiFi 固件含版本字符串", tail in wf.read_bytes())
+    else:
+        print("  SKIP WiFi 固件（已停用，不再随包发布）")
 
     print("[APK]")
-    apks = sorted(rel.glob(f"Movo-{ver}*.apk"))
+    apks = sorted(rel.glob(f"Fremote-{ver}*.apk")) or sorted(rel.glob(f"Movo-{ver}*.apk"))
     check("APK 存在", bool(apks))
     if apks:
         with zipfile.ZipFile(apks[0]) as z:

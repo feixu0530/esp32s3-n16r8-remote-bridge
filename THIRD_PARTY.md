@@ -19,3 +19,10 @@
 固件基于 **ESP-IDF**（Apache-2.0）与 **Apache NimBLE**（Apache-2.0）构建：
 - https://github.com/espressif/esp-idf
 - https://github.com/apache/mynewt-nimble
+
+## 手机 App（Fremote）的上游
+
+`Fremote-2.0.0.apk` 基于开源项目 **movo** 的 Android WebView 遥控端修改而来：
+- 项目地址：https://github.com/dsnaaa/movo
+- 原项目作者与贡献者保留署名；本项目的改动（BLE 直连、快捷键页、界面与文案调整）
+  及原项目代码的许可遵循其仓库说明。

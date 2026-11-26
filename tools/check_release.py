@@ -9,12 +9,13 @@
     python tools/check_release.py 1.3.3      # 指定版本
 
 检查项：
-    1. firmware/remote_bridge.bin  与 dev/firmware/bridge/build/ 同哈希
-    2. firmware-wifi/remote_bridge.bin 与 build_wifi/ 同哈希
-    3. 两个固件 bin 里都能找到对应版本字符串
+    1. firmware/remote_bridge-<版本>.bin 与 dev/firmware/bridge/build/ 同哈希
+    2. 发布根目录固件与 firmware/ 同哈希，且两个 bin 都含对应版本字符串
+    3. firmware-wifi/remote_bridge.bin 与 build_wifi/ 同哈希（若存在）
     4. APK 里的 setup.html / touchpad.html / i18n.js 是当前仓库版本
     5. 绿色版（_internal/firmware）里的固件与 firmware/ 同哈希
-    6. SHA256SUMS.txt 自检
+    6. 源码 ZIP 含发布脚本，且脚本内容与当前仓库一致
+    7. SHA256SUMS.txt 自检
 """
 from __future__ import annotations
 
@@ -71,6 +72,18 @@ def fix_html(path: Path) -> str:
     return pa.fix_html(path.read_text(encoding="utf-8"))
 
 
+def ble_firmware_path(rel: Path, ver: str) -> Path:
+    return rel / "firmware" / f"remote_bridge-{ver}.bin"
+
+
+def root_firmware_path(rel: Path, ver: str) -> Path:
+    return rel / f"remote_bridge-{ver}.bin"
+
+
+def source_archive_path(rel: Path, ver: str) -> Path:
+    return rel / f"ESP32S3-all-remote-{ver}-src.zip"
+
+
 def main() -> int:
     ver = sys.argv[1] if len(sys.argv) > 1 else latest_version()
     rel = RELEASES / ver
@@ -79,11 +92,15 @@ def main() -> int:
     print(f"=== 审计 releases/{ver} ===")
 
     print("[固件]")
-    fw = rel / "firmware" / "remote_bridge.bin"
+    fw = ble_firmware_path(rel, ver)
+    root_fw = root_firmware_path(rel, ver)
     wf = rel / "firmware-wifi" / "remote_bridge.bin"
     check("BLE 固件与 build/ 同哈希", fw.is_file() and fw.read_bytes() == (FW_BUILD / "remote_bridge.bin").read_bytes())
+    check("发布根目录固件与 firmware/ 同哈希",
+          root_fw.is_file() and fw.is_file() and root_fw.read_bytes() == fw.read_bytes())
     tail = ver.encode()
     check("BLE 固件含版本字符串", fw.is_file() and tail in fw.read_bytes())
+    check("发布根目录固件含版本字符串", root_fw.is_file() and tail in root_fw.read_bytes())
     if wf.is_file():
         check("WiFi 固件与 build_wifi/ 同哈希", wf.read_bytes() == (FW_WIFI / "remote_bridge.bin").read_bytes())
         check("WiFi 固件含版本字符串", tail in wf.read_bytes())
@@ -114,6 +131,24 @@ def main() -> int:
     print("[绿色版]")
     exe_fw = rel / "ESP32S3RemoteBridge" / "_internal" / "firmware" / "remote_bridge.bin"
     check("绿色版固件与 firmware/ 同哈希", exe_fw.is_file() and fw.is_file() and exe_fw.read_bytes() == fw.read_bytes())
+
+    print("[源码包]")
+    src_zip = source_archive_path(rel, ver)
+    check("源码 ZIP 存在", src_zip.is_file())
+    required_sources = {
+        "dev/client/build/make_release.py": ROOT / "dev" / "client" / "build" / "make_release.py",
+        "dev/client/build/package.py": ROOT / "dev" / "client" / "build" / "package.py",
+        "dev/client/build/make_readme.py": ROOT / "dev" / "client" / "build" / "make_readme.py",
+        "tools/check_release.py": ROOT / "tools" / "check_release.py",
+    }
+    if src_zip.is_file():
+        with zipfile.ZipFile(src_zip) as z:
+            names = set(z.namelist())
+            for arc, src in required_sources.items():
+                check(f"源码 ZIP 含 {arc}", arc in names)
+                if arc in names:
+                    check(f"源码 ZIP 的 {arc} 与仓库一致",
+                          z.read(arc) == src.read_bytes())
 
     print("[校验和]")
     sums = rel / "SHA256SUMS.txt"

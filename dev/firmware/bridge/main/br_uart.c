@@ -38,7 +38,6 @@ static const char *TAG = "br_uart";
 #define UART_BAUD 115200
 #define RX_BUF_SIZE 1024
 
-static QueueHandle_t s_rx_queue = NULL;
 static bool s_ready = false;
 
 static void uart_event_task(void *arg)
@@ -104,7 +103,7 @@ void br_uart_init(void)
     /*
      * ★ 栈不能太小 ★
      *   3072 会炸：往 UART 发一条 BONDED 命令，固件打印完
-     *   「bonded[0] 7E:A2:99:61:45:FE」立刻
+     *   「bonded[0] 7E:A2:AA:BB:CC:02」立刻
      *     ***ERROR*** A stack overflow in task uart_rx has been detected
      *   然后整个板子重启。
      *   原因：handle_command 帧里 br_parsed_t(约 650B) + br_kv_t(512B)

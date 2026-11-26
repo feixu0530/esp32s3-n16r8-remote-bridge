@@ -131,6 +131,13 @@ def write_notes(version: str, outdir: Path, notes: str) -> None:
     print(f"  变更说明 -> {outdir / 'changes.md'} (+ releases_node.md)")
 
 
+def check_passed(returncode: int, output: str) -> bool:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return (returncode == 0
+            and not any(line.startswith("FAIL") for line in lines)
+            and any(line.endswith("全部通过") for line in lines))
+
+
 def run_checks() -> bool:
     """打包前的两道强制关卡（v0.7.1 的教训：语法正确 ≠ 显示正确）。"""
     print("=" * 66)
@@ -155,7 +162,8 @@ def run_checks() -> bool:
                  "tests/test_v022.py",
                  "tests/test_v023.py",
                  "tests/test_v024.py",
-                 "tests/test_v110_contract.py"):
+                 "tests/test_v110_contract.py", "tests/test_xiaomi.py",
+                 "tests/test_xiaomi_voice.py", "tests/test_release.py"):
         print(f"\n  > {test}")
         # ★ encoding 必须写死 utf-8 ★
         #   子进程被我们用 PYTHONIOENCODING 强制成 UTF-8 了，
@@ -168,8 +176,11 @@ def run_checks() -> bool:
         tail = [l for l in (r.stdout or "").splitlines() if l.strip()][-3:]
         for l in tail:
             print("   ", l)
-        if r.returncode != 0:
-            print("    ✘ 失败")
+        if not check_passed(r.returncode, r.stdout or ""):
+            print("    ✘ 失败（退出码或汇总行不通过）")
+            if not any(line.strip().endswith("全部通过")
+                       for line in (r.stdout or "").splitlines()):
+                print("    缺少「全部通过」汇总行")
             err = (r.stderr or "").splitlines()[-8:]
             for l in err:
                 print("    ", l)

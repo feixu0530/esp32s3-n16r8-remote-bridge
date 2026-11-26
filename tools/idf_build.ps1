@@ -52,7 +52,7 @@ foreach ($d in $openocdDirs) {
 $env:PATH = ($toolPaths -join ";") + ";" + $env:PATH
 
 if ([string]::IsNullOrEmpty($ProjectPath)) {
-    $ProjectPath = Join-Path $PSScriptRoot "..\dev\firmware\ble_hid_bridge"
+    $ProjectPath = Join-Path $PSScriptRoot "..\dev\firmware\bridge"
 }
 $ProjectPath = (Resolve-Path $ProjectPath).Path
 Set-Location $ProjectPath

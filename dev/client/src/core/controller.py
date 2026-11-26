@@ -861,6 +861,7 @@ class BridgeController(QObject):
         实物图上的热区。
 
         谷歌遥控器：固定档案里的 15 个键；
+        小米遥控器：固定档案里的 12 个键（含语音键）；
         手机：没有实物图，改用「自定义键在截图里的格点」——
         与 buttonList **同序**，连线和选中才能一一对上。
         """
@@ -868,7 +869,7 @@ class BridgeController(QObject):
             return [{"button_id": h.button_id, "x": h.x, "y": h.y,
                      "width": h.width, "height": h.height,
                      "is_voice": h.is_voice, "custom": False, "visible": True}
-                    for h in remote_layout.CHROMECAST_HOTSPOTS]
+                    for h in remote_layout.hotspots_for(self._remote_kind())]
 
         # 手机布局的行数随内容增长（滚屏）；坐标交给 QML 按像素画，
         # 这里只给 col/row/rows，避免「限量 12 个」时的固定 3×4 假设。
@@ -1897,30 +1898,31 @@ class BridgeController(QObject):
             self._load_mappings()
             self._set_status("已恢复本机保存的型号默认映射")
             return True
-        actions = remote_layout.DEFAULT_ACTIONS
-        long_actions = remote_layout.DEFAULT_LONG_ACTIONS
+        kind = self._remote_kind()
+        actions = remote_layout.default_actions_for(kind)
+        long_actions = remote_layout.default_long_actions_for(kind)
         prof = remote_layout.profile_for_name(self._current_remote_name())
         if prof is not None:
             actions = prof["actions"]          # type: ignore[assignment]
             long_actions = prof.get("long_actions") or long_actions
         bindings: dict = {}
         for button_id, label in actions.items():
-            key_id = remote_layout.button_key_id(button_id)
+            key_id = remote_layout.button_key_id_for(kind, button_id)
             if not key_id:
                 continue          # 语音键没有 HID usage
-            kind = label_to_kind(label)
-            action = ButtonAction(kind if kind is not None else ActionKind.DISABLED)
+            k = label_to_kind(label)
+            action = ButtonAction(k if k is not None else ActionKind.DISABLED)
             bindings = set_button_action(bindings, key_id,
                                          ButtonTrigger.SINGLE_CLICK, action)
         # ★ 长按也要铺 ★
         #   返回键长按 = 退格（连着删）。固件的出厂默认里也有这一条，
         #   两边必须一致，否则条数对不上、又会弹冲突窗。
         for button_id, label in (long_actions or {}).items():
-            key_id = remote_layout.button_key_id(button_id)
+            key_id = remote_layout.button_key_id_for(kind, button_id)
             if not key_id:
                 continue
-            kind = label_to_kind(label)
-            action = ButtonAction(kind if kind is not None else ActionKind.DISABLED)
+            k = label_to_kind(label)
+            action = ButtonAction(k if k is not None else ActionKind.DISABLED)
             bindings = set_button_action(bindings, key_id,
                                          ButtonTrigger.LONG_PRESS, action)
         return bindings
@@ -2382,9 +2384,13 @@ class BridgeController(QObject):
         ★ 用随包的那张固定档案图 ★
           上传平面图 + 标标记的老做法已经去掉（参考项目也没有这套），
           实物图与热点坐标是配套的，必须用同一张。
+          不同型号用各自那张（小米遥控器有自己那张）。
         """
         from core.resources import assets_dir
-        p = assets_dir() / "remotes" / "Chromecast-remote-photo.png"
+        name = "Chromecast-remote-photo.png"
+        if self._remote_kind() == remote_layout.LAYOUT_XIAOMI:
+            name = "Xiaomi-remote.png"
+        p = assets_dir() / "remotes" / name
         if not p.is_file():
             return ""
         return p.as_uri()
@@ -2491,6 +2497,7 @@ class BridgeController(QObject):
         self._voice_key_mods = mods
         self._voice_key_keys = list(keys)
         self.voiceKeyChanged.emit()
+        self._refresh_voice_button_row()
         self._proto.send("VOICEKEY", mods, len(keys), *keys)
         # 回读确认（板子存的和发的一致）
         self._ask("VOICEKEY", timeout=2.0, on_ok=self._on_voice_key)
@@ -3116,8 +3123,9 @@ class BridgeController(QObject):
             self._load_mappings()
             self._set_status("已恢复本机保存的型号默认映射")
             return True
-        actions = remote_layout.DEFAULT_ACTIONS
-        long_actions = remote_layout.DEFAULT_LONG_ACTIONS
+        kind = self._remote_kind()
+        actions = remote_layout.default_actions_for(kind)
+        long_actions = remote_layout.default_long_actions_for(kind)
         prof = remote_layout.profile_for_name(self._current_remote_name())
         if prof is not None:
             actions = prof["actions"]          # type: ignore[assignment]
@@ -3127,20 +3135,20 @@ class BridgeController(QObject):
             for k, v in self._bindings.items():
                 bindings[k] = dict(v) if isinstance(v, dict) else v
         for button_id, label in actions.items():
-            key_id = remote_layout.button_key_id(button_id)
+            key_id = remote_layout.button_key_id_for(kind, button_id)
             if not key_id:
                 continue          # 语音键没有 HID usage
-            kind = label_to_kind(label)
-            action = ButtonAction(kind if kind is not None else ActionKind.DISABLED)
+            k = label_to_kind(label)
+            action = ButtonAction(k if k is not None else ActionKind.DISABLED)
             bindings = set_button_action(bindings, key_id,
                                          ButtonTrigger.SINGLE_CLICK, action)
         # ★ 长按也恢复（返回键长按 = 退格）★
         for button_id, label in (long_actions or {}).items():
-            key_id = remote_layout.button_key_id(button_id)
+            key_id = remote_layout.button_key_id_for(kind, button_id)
             if not key_id:
                 continue
-            kind = label_to_kind(label)
-            action = ButtonAction(kind if kind is not None else ActionKind.DISABLED)
+            k = label_to_kind(label)
+            action = ButtonAction(k if k is not None else ActionKind.DISABLED)
             bindings = set_button_action(bindings, key_id,
                                          ButtonTrigger.LONG_PRESS, action)
         self._bindings = bindings
@@ -3445,6 +3453,26 @@ class BridgeController(QObject):
             self._voice_key_mods = mods
             self._voice_key_keys = keys
             self.voiceKeyChanged.emit()
+        # 回读值没变也要刷一次：语音页刚录完时本地值已经先更新了，
+        # 只靠「值变了」判断会让按键页那一行停在旧值。
+        self._refresh_voice_button_row()
+
+    def _refresh_voice_button_row(self) -> None:
+        """
+        语音键行不参与映射编辑，但它的显示值来自语音页。
+
+        按键表通常在 VOICEKEY 回读之前就建好了，不在这里补一次，
+        那一行会一直停在「未设置」。
+        """
+        label = self._voice_key_label()
+        changed = False
+        for item in self._button_items:
+            if item.get("is_voice") and item.get("single") != label:
+                item["single"] = label
+                changed = True
+        if changed:
+            self.mappingModel.set_items(list(self._button_items))
+            self.mappingsChanged.emit()
 
     def _voice_key_label(self) -> str:
         # ★ 显示键名，不显示 0x 键值 ★
@@ -4128,8 +4156,11 @@ class BridgeController(QObject):
         """
         self._learn_target = f"0x{usage:02X}"
         button_id = ""
+        kind = self._remote_kind()
         if src == remote_layout.BR_SRC_CONSUMER:
-            button_id = remote_layout.usage_to_button_id().get(usage, "")
+            button_id = remote_layout.usage_to_button_id_for(kind).get(usage, "")
+        elif src == remote_layout.BR_SRC_KEYBOARD:
+            button_id = remote_layout.usage_to_button_id_for(kind).get(usage, "")
         elif src == remote_layout.BR_SRC_PHONE:
             kid = remote_layout.custom_id_of_usage(usage)
             if kid:
@@ -4139,7 +4170,7 @@ class BridgeController(QObject):
             key_name = str(ck["name"]) if ck else f"自定义键 {kid}"
             self.setSelectedButtonId(button_id)
         elif button_id:
-            key_name = remote_layout.display_name(button_id)
+            key_name = remote_layout.display_name_for(kind, button_id)
             self.setSelectedButtonId(button_id)
         else:
             key_name = f"未知键（usage=0x{usage:02X}）"
@@ -4181,15 +4212,18 @@ class BridgeController(QObject):
             usage = int(kv.get("usage", "0") or 0)
         except (TypeError, ValueError):
             return
-        if src != remote_layout.BR_SRC_CONSUMER:
+        if src == remote_layout.BR_SRC_CONSUMER:
+            src_kind = remote_layout.LAYOUT_CHROMECAST
+        elif src == remote_layout.BR_SRC_KEYBOARD:
+            # ★ 小米那台的按键走键盘页（src=1）★
+            src_kind = remote_layout.LAYOUT_XIAOMI
+        elif src == remote_layout.BR_SRC_PHONE:
             # ★ 手机（临时遥控器）的键也要能配 PC 专属动作 ★
             #   以前这里写死「只认消费者页」，src=6 的手机事件被直接丢掉 ——
             #   结果手机上按快捷键，PC 端一点反应都没有。
-            if src != remote_layout.BR_SRC_PHONE:
-                return
             src_kind = remote_layout.LAYOUT_PHONE
         else:
-            src_kind = remote_layout.LAYOUT_CHROMECAST
+            return
         button_id = remote_layout.usage_to_button_id_for(src_kind).get(usage, "")
         if not button_id and src_kind == remote_layout.LAYOUT_PHONE:
             kid = remote_layout.custom_id_of_usage(usage)

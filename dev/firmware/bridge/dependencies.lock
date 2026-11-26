@@ -1,0 +1,24 @@
+dependencies:
+  esp_tinyusb:
+    dependencies: []
+    source:
+      path: components/esp_tinyusb
+      type: local
+    version: 2.4.0
+  idf:
+    source:
+      type: idf
+    version: 6.1.0
+  tinyusb:
+    dependencies: []
+    source:
+      path: components/tinyusb
+      type: local
+    version: 0.21.0~3
+direct_dependencies:
+- espressif/esp_tinyusb
+- espressif/tinyusb
+- idf
+manifest_hash: d2859c3040a3396e2a9d8456e2da6baa2ca6fe1b93023397cc5b9db404f4942a
+target: esp32s3
+version: 3.0.0

@@ -20,6 +20,11 @@
 - https://github.com/espressif/esp-idf
 - https://github.com/apache/mynewt-nimble
 
+固件还原样引入 ESP-IDF 内的 **Open Interface SBC/mSBC 解码器**（Apache-2.0）
+用于小米遥控器语音，位于 `dev/firmware/bridge/components/xiaomi_msbc/`：
+- 上游：https://github.com/espressif/esp-idf/tree/master/components/bt/host/bluedroid/external/sbc/decoder
+- 仅新增 `shim/common/bt_target.h` 选择解码器与布尔常量，未修改解码器源码。
+
 ## 手机 App（Fremote）的上游
 
 `Fremote-2.0.0.apk` 基于开源项目 **movo** 的 Android WebView 遥控端修改而来：

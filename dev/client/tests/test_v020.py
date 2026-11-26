@@ -70,14 +70,25 @@ def _parse_firmware_defaults() -> dict:
 
     返回 {key_id: (trig, out, mods, (keys...))}
     """
+    return _parse_firmware_array("k_binds_chromecast")
+
+
+def _parse_firmware_array(name: str) -> dict:
+    """抠出固件里某一张型号默认表。"""
     src = (FW_MAIN / "br_mapping.c").read_text(encoding="utf-8")
-    m = re.search(r"k_binds_chromecast\[\]\s*=\s*\{(.*?)\n\};", src, re.S)
+    m = re.search(name + r"\[\]\s*=\s*\{(.*?)\n\};", src, re.S)
     if not m:
         return {}
     body = m.group(1)
     out: dict = {}
     pattern = (r"\{\s*(\d+)u\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"
                r"(0x[0-9A-Fa-f]+|\d+)\s*,\s*(\d+)\s*,\s*\{([^}]*)\}\s*\}")
+    # 小米那张表用 BR_KEY_MAKE(src, usage) 写 key_id —— 也要认
+    macro_pattern = (r"\{\s*BR_KEY_MAKE\(BR_SRC_(\w+),\s*"
+                     r"(0x[0-9A-Fa-f]+|\d+)\)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"
+                     r"(0x[0-9A-Fa-f]+|\d+)\s*,\s*(\d+)\s*,\s*\{([^}]*)\}\s*\}")
+    src_ids = {"KEYBOARD": 1, "CONSUMER": 2, "DATA": 3, "VENDOR": 4,
+               "ATVV": 5, "PHONE": 6}
     for row in re.finditer(pattern, body):
         key_id = int(row.group(1))
         trig = int(row.group(2))
@@ -86,29 +97,41 @@ def _parse_firmware_defaults() -> dict:
         keys = tuple(int(x, 0) for x in re.findall(r"0x[0-9A-Fa-f]+|\d+",
                                                   row.group(6)))
         out[key_id] = (trig, out_type, mods, keys)
+    for row in re.finditer(macro_pattern, body):
+        src = src_ids.get(row.group(1))
+        if src is None:
+            continue
+        usage = int(row.group(2), 0)
+        key_id = (src << 12) | (usage & 0x0FFF)
+        trig = int(row.group(3))
+        out_type = int(row.group(4))
+        mods = int(row.group(5), 0)
+        keys = tuple(int(x, 0) for x in re.findall(r"0x[0-9A-Fa-f]+|\d+",
+                                                  row.group(7)))
+        out[key_id] = (trig, out_type, mods, keys)
     return out
 
 
-def _pc_default_shape() -> dict:
+def _pc_default_shape(kind: str = remote_layout.LAYOUT_CHROMECAST) -> dict:
     """PC 侧默认表 → 和固件一样的形状。"""
     bindings: dict = {}
-    for button_id, label in remote_layout.DEFAULT_ACTIONS.items():
-        key_id = remote_layout.button_key_id(button_id)
+    for button_id, label in remote_layout.default_actions_for(kind).items():
+        key_id = remote_layout.button_key_id_for(kind, button_id)
         if not key_id:
             continue
-        kind = label_to_kind(label)
-        action = ButtonAction(kind if kind is not None else ActionKind.DISABLED)
+        k = label_to_kind(label)
+        action = ButtonAction(k if k is not None else ActionKind.DISABLED)
         bindings = set_button_action(bindings, key_id,
                                      ButtonTrigger.SINGLE_CLICK, action)
     # ★ 长按也要比 ★
     #   返回键长按 = 退格（固件 k_binds_chromecast 里 trig=2 那一条）。
     #   不比的话两边条数会差 1，却谁也发现不了。
-    for button_id, label in remote_layout.DEFAULT_LONG_ACTIONS.items():
-        key_id = remote_layout.button_key_id(button_id)
+    for button_id, label in remote_layout.default_long_actions_for(kind).items():
+        key_id = remote_layout.button_key_id_for(kind, button_id)
         if not key_id:
             continue
-        kind = label_to_kind(label)
-        action = ButtonAction(kind if kind is not None else ActionKind.DISABLED)
+        k = label_to_kind(label)
+        action = ButtonAction(k if k is not None else ActionKind.DISABLED)
         bindings = set_button_action(bindings, key_id,
                                      ButtonTrigger.LONG_PRESS, action)
     out: dict = {}
@@ -135,6 +158,22 @@ def _pc_default_shape() -> dict:
     return out
 
 
+def _compare_profile(name: str, fw_array: str, kind: str) -> None:
+    """一个型号的固件默认表 ↔ PC 默认表必须逐条一致。"""
+    fw = _parse_firmware_array(fw_array)
+    check("%s 固件默认表能抠出来且不为空" % name, len(fw) >= 10, str(len(fw)))
+    if not fw:
+        return
+    pc = _pc_default_shape(kind)
+    missing = [k for k in pc if k not in fw]
+    check("%s PC 默认表里的每一条固件里都有" % name, not missing, str(missing))
+    diff = [k for k in pc if k in fw and fw[k] != pc[k]]
+    check("%s 两边的键序列逐条一致" % name, not diff,
+          str([(k, fw.get(k), pc.get(k)) for k in diff]))
+    extra = [k for k in fw if k not in pc]
+    check("%s 固件里没有多余的条目" % name, not extra, str(extra))
+
+
 def test_firmware_default_profile() -> None:
     """固件必须有一张「按型号分档」的默认表。"""
     src = (FW_MAIN / "br_mapping.c").read_text(encoding="utf-8")
@@ -144,17 +183,13 @@ def test_firmware_default_profile() -> None:
           "name_match" in src and "profile_for_name" in src, "")
     check("谷歌遥控器是一档",
           '"chromecast"' in src, "")
+    check("小米遥控器是一档",
+          '"xiaomi"' in src and "k_binds_xiaomi" in src, "")
 
-    fw = _parse_firmware_defaults()
-    check("固件默认表能抠出来且不为空", len(fw) >= 10, str(len(fw)))
-    if not fw:
-        return
-    pc = _pc_default_shape()
-    missing = [k for k in pc if k not in fw]
-    check("PC 默认表里的每一条固件里都有", not missing, str(missing))
-    diff = [k for k in pc if k in fw and fw[k] != pc[k]]
-    check("两边的键序列逐条一致", not diff,
-          str([(k, fw.get(k), pc.get(k)) for k in diff]))
+    _compare_profile("谷歌遥控器", "k_binds_chromecast",
+                     remote_layout.LAYOUT_CHROMECAST)
+    _compare_profile("小米遥控器", "k_binds_xiaomi",
+                     remote_layout.LAYOUT_XIAOMI)
 
 
 def test_apply_defaults_takes_name() -> None:
@@ -179,7 +214,7 @@ def test_firmware_version() -> None:
     """固件版本号必须会说实话。"""
     src = (FW_MAIN / "app_main.c").read_text(encoding="utf-8")
     check("固件版本号是 1.2.3",
-          '#define FW_VERSION "2.0.0"' in src, "")
+          '#define FW_VERSION "3.0.0"' in src, "")
 
 
 def test_defaults_applied_offline() -> None:
@@ -352,7 +387,7 @@ def test_qml_dialog_and_width() -> None:
 def test_client_version() -> None:
     """客户端版本号。"""
     from core import version
-    check("客户端版本 1.2.3", version.VERSION == "2.0.0", version.VERSION)
+    check("客户端版本 1.2.3", version.VERSION == "3.0.0", version.VERSION)
 
 
 def test_local_is_master_no_compare(ctl: BridgeController) -> None:

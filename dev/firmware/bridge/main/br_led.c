@@ -321,7 +321,6 @@ void bridge_led_phone_activity(void)
 void bridge_led_task(void *arg)
 {
     (void)arg;
-    uint32_t last_voice = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     while (1) {
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;

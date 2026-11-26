@@ -1112,13 +1112,6 @@ bool bridge_usb_hid_ready(void)
  *   1. CDC 没被主机打开时日志全部丢失，调试时什么都看不到
  *   2. 日志量比协议大得多，会把 CDC 缓冲冲爆
  */
-static int bridge_usb_log_vprintf(const char *fmt, va_list args)
-{
-    (void)fmt;
-    (void)args;
-    return 0;   /* 不接管，日志走 stdout(UART0) */
-}
-
 void bridge_usb_install_log_hook(void)
 {
     /*

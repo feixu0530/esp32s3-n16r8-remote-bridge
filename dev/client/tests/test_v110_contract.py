@@ -168,7 +168,8 @@ def main() -> int:
     # 10. PC 端不能把手机的键（src=6）当噪声丢掉
     check("PC 端 PC 动作认 src=6",
           "BR_SRC_PHONE" in ctrl and
-          "src != remote_layout.BR_SRC_PHONE" in ctrl)
+          ("src == remote_layout.BR_SRC_PHONE" in ctrl or
+           "src != remote_layout.BR_SRC_PHONE" in ctrl))
 
     # 11. 两套布局的键位空间必须隔离
     layout = _load_layout()

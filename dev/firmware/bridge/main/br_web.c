@@ -45,7 +45,9 @@ static const char *TAG = "br_web";
 #define BR_WEB_MAX_PCM_BODY 4096
 
 static httpd_handle_t s_httpd;
+#if BR_WEB_ENABLE_TLS
 static httpd_handle_t s_tlsd;
+#endif
 static bool s_ready;
 
 /* ---------------------------------------------------------------- 事件队列 */

@@ -30,6 +30,10 @@ from typing import Dict, List, Optional, Tuple
 # ★ 消费者页 source ★
 BR_SRC_CONSUMER = 2
 
+# ★ 键盘页 source（小米那台用这个）★
+# 与固件 br_types.h 的 BR_SRC_KEYBOARD 一一对应 —— 两边必须一致。
+BR_SRC_KEYBOARD = 1
+
 # ★ 手机（移动端）source ★
 # 与固件 br_types.h 的 BR_SRC_PHONE 一一对应 —— 两边必须一致。
 BR_SRC_PHONE = 6
@@ -216,6 +220,115 @@ def visual_row(button_id: str) -> int:
     return VISUAL_ROWS.get(button_id, 0)
 
 
+# ------------------------------------------------------------------ 小米布局
+#
+# ★ 小米蓝牙语音遥控器一代（广播名 "MI RC" / "小米蓝牙语音遥控器"）★
+#
+#   实测（2026-11-24，证据见 dev/docs/xiaomi-gen1-capture.md）：
+#   它的按键走**键盘页**（Usage Page 0x07），8 字节标准键盘报告：
+#       byte0=修饰键  byte1=保留  byte2..7=键码
+#   所以小米这台的 key_id 是 "1:<usage>"（source=键盘页），
+#   谷歌那台是 "2:<usage>"（source=消费者页）—— 两个空间天然隔离。
+#
+#   实物图：src/assets/remotes/Xiaomi-remote.png
+#   （由 reference/小米语音遥控器.jpg 裁剪而来，热点坐标按这张图标定）
+#
+#   遥控器上有：电源、语音、圆环（上/下/左/右 + 圆心确定）、
+#   主页、返回、菜单、音量+、音量− —— 共 11 个可配键 + 1 个语音键。
+
+XIAOMI_HOTSPOTS: Tuple[ButtonHotspot, ...] = (
+    ButtonHotspot("power", .42, .045, .16, .045),
+    ButtonHotspot("mic", .40, .115, .20, .05, is_voice=True),
+    ButtonHotspot("up", .43, .165, .14, .05),
+    ButtonHotspot("left", .10, .235, .14, .07),
+    ButtonHotspot("ok", .36, .240, .28, .08),
+    ButtonHotspot("right", .76, .235, .14, .07),
+    ButtonHotspot("down", .43, .315, .14, .05),
+    ButtonHotspot("home", .16, .425, .10, .04),
+    ButtonHotspot("back", .445, .430, .10, .045),
+    ButtonHotspot("menu", .755, .430, .08, .04),
+    ButtonHotspot("volume_up", .45, .500, .10, .04),
+    ButtonHotspot("volume_down", .45, .590, .10, .04),
+)
+
+XIAOMI_HOTSPOTS_BY_ID: Dict[str, ButtonHotspot] = {
+    hotspot.button_id: hotspot for hotspot in XIAOMI_HOTSPOTS
+}
+
+XIAOMI_DISPLAY_NAMES: Dict[str, str] = {
+    "power": "电源键",
+    "mic": "语音键",
+    "up": "上键",
+    "down": "下键",
+    "left": "左键",
+    "right": "右键",
+    "ok": "确定键",
+    "home": "主页键",
+    "back": "返回键",
+    "menu": "菜单键",
+    "volume_up": "音量 + 键",
+    "volume_down": "音量 − 键",
+}
+
+XIAOMI_SHORT_NAMES: Dict[str, str] = {
+    "power": "电源",
+    "mic": "语音",
+    "up": "上",
+    "down": "下",
+    "left": "左",
+    "right": "右",
+    "ok": "确定",
+    "home": "主页",
+    "back": "返回",
+    "menu": "菜单",
+    "volume_up": "音+",
+    "volume_down": "音-",
+}
+
+# ★ HID usage（键盘页 0x07）★ 与固件 br_mapping.c 的 k_binds_xiaomi[] 一致
+XIAOMI_USAGES: Dict[str, int] = {
+    "power": 0x66,
+    "up": 0x52, "down": 0x51, "left": 0x50, "right": 0x4F,
+    "ok": 0x28,
+    "home": 0x4A,
+    "back": 0xF1,
+    "menu": 0x65,
+    "volume_up": 0x80, "volume_down": 0x81,
+}
+
+XIAOMI_BUTTON_ORDER: Tuple[str, ...] = tuple(h.button_id for h in XIAOMI_HOTSPOTS)
+
+# 两列都按实物从上到下排：电源在顶、音量在底，右侧语音在顶。
+XIAOMI_LEFT_BUTTON_IDS: Tuple[str, ...] = (
+    "power", "up", "left", "down", "home", "back", "menu",
+)
+XIAOMI_RIGHT_BUTTON_IDS: Tuple[str, ...] = (
+    "mic", "ok", "right", "volume_up", "volume_down",
+)
+
+XIAOMI_VISUAL_ROWS: Dict[str, int] = {
+    "power": 0, "up": 1, "left": 2, "down": 3,
+    "home": 4, "back": 5, "menu": 6,
+    "mic": 0, "ok": 1, "right": 2, "volume_up": 3, "volume_down": 4,
+}
+
+# 出厂默认动作（与固件 br_mapping.c 的 k_binds_xiaomi[] 一一对应）
+XIAOMI_DEFAULT_ACTIONS: Dict[str, str] = {
+    "power": "Escape",
+    "up": "方向上", "down": "方向下",
+    "left": "方向左", "right": "方向右",
+    "ok": "回车",
+    "home": "显示桌面",
+    "back": "退格",
+    "menu": "右键菜单",
+    "volume_up": "系统音量 +", "volume_down": "系统音量 −",
+}
+
+XIAOMI_DEFAULT_LONG_ACTIONS: Dict[str, str] = {
+    "back": "退格",
+}
+
+
 # ------------------------------------------------------------------ 内置默认
 # 照抄参考项目 key_mapping.py:459 default_button_actions()，
 # 再按 chromecast profile 补上 volume_mute（参考项目 remote_layout.py:157）。
@@ -266,6 +379,14 @@ DEFAULT_PROFILES: List[Dict[str, object]] = [
         "name_match": ("chromecast", "media remote"),
         "actions": DEFAULT_ACTIONS,
         "long_actions": DEFAULT_LONG_ACTIONS,
+    },
+    {
+        "id": "xiaomi",
+        "label": "小米遥控器",
+        "name_match": ("mi rc", "小米蓝牙语音遥控器", "xiaomi remote",
+                       "xiaomi bluetooth remote"),
+        "actions": XIAOMI_DEFAULT_ACTIONS,
+        "long_actions": XIAOMI_DEFAULT_LONG_ACTIONS,
     },
 ]
 
@@ -364,7 +485,8 @@ PHONE_DEFAULT_ACTIONS: Dict[str, str] = {
 # 所有布局的种类
 LAYOUT_CHROMECAST = "chromecast"
 LAYOUT_PHONE = "phone"
-LAYOUT_KINDS: Tuple[str, ...] = (LAYOUT_CHROMECAST, LAYOUT_PHONE)
+LAYOUT_XIAOMI = "xiaomi"
+LAYOUT_KINDS: Tuple[str, ...] = (LAYOUT_CHROMECAST, LAYOUT_PHONE, LAYOUT_XIAOMI)
 
 
 def layout_kind_for_remote(remote: object) -> str:
@@ -372,24 +494,43 @@ def layout_kind_for_remote(remote: object) -> str:
 
     配置里没写 kind 的一律当谷歌遥控器 —— 老的配置不能因为加了新类型就失效。
     """
-    if isinstance(remote, dict) and str(remote.get("kind", "")) == LAYOUT_PHONE:
-        return LAYOUT_PHONE
+    if isinstance(remote, dict):
+        kind = str(remote.get("kind", ""))
+        if kind == LAYOUT_PHONE:
+            return LAYOUT_PHONE
+        if kind == LAYOUT_XIAOMI:
+            return LAYOUT_XIAOMI
+        if kind == LAYOUT_CHROMECAST:
+            return LAYOUT_CHROMECAST
+        name = str(remote.get("name", ""))
+        if name:
+            prof = profile_for_name(name)
+            if prof and prof.get("id") == LAYOUT_XIAOMI:
+                return LAYOUT_XIAOMI
     return LAYOUT_CHROMECAST
 
 
 def button_order_for(kind: str) -> Tuple[str, ...]:
-    return PHONE_BUTTON_ORDER if kind == LAYOUT_PHONE else BUTTON_ORDER
+    if kind == LAYOUT_PHONE:
+        return PHONE_BUTTON_ORDER
+    if kind == LAYOUT_XIAOMI:
+        return XIAOMI_BUTTON_ORDER
+    return BUTTON_ORDER
 
 
 def display_name_for(kind: str, button_id: str) -> str:
     if kind == LAYOUT_PHONE:
         return PHONE_DISPLAY_NAMES.get(button_id, button_id)
+    if kind == LAYOUT_XIAOMI:
+        return XIAOMI_DISPLAY_NAMES.get(button_id, button_id)
     return display_name(button_id)
 
 
 def short_name_for(kind: str, button_id: str) -> str:
     if kind == LAYOUT_PHONE:
         return PHONE_SHORT_NAMES.get(button_id, display_name_for(kind, button_id))
+    if kind == LAYOUT_XIAOMI:
+        return XIAOMI_SHORT_NAMES.get(button_id, display_name_for(kind, button_id))
     return short_name(button_id)
 
 
@@ -406,6 +547,11 @@ def button_key_id_for(kind: str, button_id: str) -> str:
         if usage is None:
             return ""
         return f"{BR_SRC_PHONE}:{usage}"
+    if kind == LAYOUT_XIAOMI:
+        usage = XIAOMI_USAGES.get(button_id)
+        if usage is None:
+            return ""
+        return f"{BR_SRC_KEYBOARD}:{usage}"
     return button_key_id(button_id)
 
 
@@ -417,22 +563,50 @@ def is_voice_button_for(kind: str, button_id: str) -> bool:
 def visual_row_for(kind: str, button_id: str) -> int:
     if kind == LAYOUT_PHONE:
         return PHONE_VISUAL_ROWS.get(button_id, 0)
+    if kind == LAYOUT_XIAOMI:
+        return XIAOMI_VISUAL_ROWS.get(button_id, 0)
     return visual_row(button_id)
 
 
 def right_button_ids_for(kind: str) -> Tuple[str, ...]:
-    return PHONE_RIGHT_BUTTON_IDS if kind == LAYOUT_PHONE else RIGHT_BUTTON_IDS
+    if kind == LAYOUT_PHONE:
+        return PHONE_RIGHT_BUTTON_IDS
+    if kind == LAYOUT_XIAOMI:
+        return XIAOMI_RIGHT_BUTTON_IDS
+    return RIGHT_BUTTON_IDS
 
 
 def usage_to_button_id_for(kind: str) -> Dict[int, str]:
     """usage → 键 id（给人话日志用）。"""
     if kind == LAYOUT_PHONE:
         return {usage: bid for bid, usage in PHONE_USAGES.items()}
+    if kind == LAYOUT_XIAOMI:
+        return {usage: bid for bid, usage in XIAOMI_USAGES.items()
+                if usage is not None}
     return usage_to_button_id()
 
 
 def default_actions_for(kind: str) -> Dict[str, str]:
     if kind == LAYOUT_PHONE:
         return dict(PHONE_DEFAULT_ACTIONS)
+    if kind == LAYOUT_XIAOMI:
+        return dict(XIAOMI_DEFAULT_ACTIONS)
     return DEFAULT_ACTIONS
+
+
+def default_long_actions_for(kind: str) -> Dict[str, str]:
+    if kind == LAYOUT_PHONE:
+        return {}
+    if kind == LAYOUT_XIAOMI:
+        return dict(XIAOMI_DEFAULT_LONG_ACTIONS)
+    return DEFAULT_LONG_ACTIONS
+
+
+def hotspots_for(kind: str) -> Tuple[ButtonHotspot, ...]:
+    """实物图上的热点表。"""
+    if kind == LAYOUT_PHONE:
+        return ()
+    if kind == LAYOUT_XIAOMI:
+        return XIAOMI_HOTSPOTS
+    return CHROMECAST_HOTSPOTS
 

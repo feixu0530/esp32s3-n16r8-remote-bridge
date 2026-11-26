@@ -163,7 +163,8 @@ def test_key_tokens_and_pc_actions() -> None:
     ctl = (CLIENT / "src" / "core" / "controller.py").read_text(encoding="utf-8")
     check("EV KEY 会分发给 PC 动作", "self._pc_key_event(kv)" in ctl, "")
     check("PC 动作按 key_id 查绑定（绑定字典的键是 2:120）",
-          "remote_layout.button_key_id(button_id)" in ctl, "")
+          ("remote_layout.button_key_id_for(kind, button_id)" in ctl or
+           "remote_layout.button_key_id(button_id)" in ctl), "")
     cap = (CLIENT / "src" / "platforms" /
            "hotkey_capture_process.py").read_text(encoding="utf-8")
     check("录制子进程共用主进程键表",

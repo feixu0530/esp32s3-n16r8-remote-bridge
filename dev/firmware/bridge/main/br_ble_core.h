@@ -36,7 +36,7 @@ extern "C" {
 esp_err_t br_ble_init(void);
 
 /**
- * 把 BLE 地址格式化成 "7E:A2:99:61:45:FE" 这样的显示串。
+ * 把 BLE 地址格式化成 "7E:A2:AA:BB:CC:02" 这样的显示串。
  *
  * ★ NimBLE 的地址是小端字节序 ★
  *   显示时要从 addr[5] 排到 addr[0]（也就是设备上看到的那串 MAC）。
@@ -115,6 +115,9 @@ void br_ble_set_target_name(const char *substr);
 /* ---------------------------------------------------------------- 诊断 */
 /** 转储某台已连接设备的全部服务与特征 */
 void br_ble_gatt_dump(int peer_idx);
+
+/** 重跑一遍 HID 订阅（取证用：打开数据通道订阅后要重订） */
+bool br_ble_hid_resubscribe(int peer_idx);
 
 /**
  * 枚举 BLE bond 表（已配对设备）。

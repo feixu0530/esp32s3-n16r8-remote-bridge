@@ -26,6 +26,8 @@
 #include "br_mapping.h"
 #include "br_usb.h"
 #include "br_voice.h"
+#include "br_voice_input.h"
+#include "br_msbc.h"
 #include "br_led.h"
 #include "br_phone.h"
 #include "br_ble_gatt.h"
@@ -43,11 +45,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 #include <host/ble_hs.h>
 #include <host/ble_gap.h>
 #include <host/ble_gatt.h>
 #include <host/ble_store.h>
+#include <host/ble_att.h>
 #include <host/ble_uuid.h>
 #include <nimble/ble.h>
 #include <os/os_mbuf.h>
@@ -119,8 +123,16 @@ static const uint8_t k_atvv_ctl_canon[16] = {
 static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 #define OWN_ADDR_TYPE_FOR_CONNECT  s_own_addr_type
 
-#define MAX_CHRS_PER_PEER  40
-#define MAX_SVCS_PER_PEER  12
+/*
+ * ★ 每台设备最多记多少条特征 / 服务 ★
+ *
+ * 40 太少了：小米一代的 HID 服务里就有 20 多条 2A4D，
+ * 加上厂商服务（D0FF/D1FF）的特征，**总数正好顶到 40** ——
+ * 特征表一满，发现流程就停在那儿，厂商服务的特征永远看不见
+ * （实测：svcs=7 chrs=40，D0FF/D1FF 一个特征都没列出来）。
+ */
+#define MAX_CHRS_PER_PEER  96
+#define MAX_SVCS_PER_PEER  16
 
 /* ------------------------------------------------------------------ 类型 */
 
@@ -180,6 +192,7 @@ typedef struct {
     bool     used;
     uint8_t  idx;
     bool     connected;
+    uint32_t generation;
     uint16_t conn_handle;
     uint8_t  addr_type;
     uint8_t  addr[6];
@@ -211,6 +224,11 @@ typedef struct {
     br_chr_t chrs[MAX_CHRS_PER_PEER];
     int      cur_svc;
     bool     atvv_seen;
+    /* 加密后补发过一次 ATT_MTU_REQ（连接建立时那次对端经常不回） */
+    bool     mtu_requested;
+    /* MTU 协商的重试（对端不回就一直 23，语音音频发不出来） */
+    int      mtu_retry;
+    int64_t  next_mtu_retry_us;
 
     uint16_t atvv_audio_handle;
     uint16_t atvv_ctl_handle;
@@ -230,6 +248,10 @@ typedef struct {
     bool     channels_open;
     bool     channels_enc;     /* 订阅时链路是不是加密的，用来判断要不要重订阅 */
     bool     params_pending;   /* 连上后要请求一次连接参数（超时要拉长） */
+    int64_t  next_params_retry_us;
+    bool     fast_params;      /* 小米 HID 语音：7.5ms、latency 299、12s */
+    bool     xiaomi;           /* 型号标记：只用于小米 0x3E 语音路由 */
+    bool     phy_requested;    /* 每条连接只请求一次 2M PHY */
 } br_peer_t;
 
 /* ------------------------------------------------------------------ 全局 */
@@ -237,6 +259,7 @@ static br_candidate_t s_candidates[BR_MAX_CANDIDATES];
 static int            s_candidate_count;
 static br_peer_t      s_peers[BR_MAX_PEERS];
 static int            s_peer_count;
+static uint32_t s_next_peer_generation;
 
 static bool s_scanning;
 static bool s_scan_continuous;
@@ -416,6 +439,7 @@ typedef struct {
      *   入队时就把 peer 记下来，处理时直接用，不会串。
      */
     int8_t   peer;
+    uint32_t generation;
     uint8_t  data[AU_ITEM_MAX];
 } au_item_t;
 
@@ -425,6 +449,177 @@ static QueueHandle_t s_auq = NULL;
 #define KEYQ_LEN 64
 static QueueHandle_t s_keyq = NULL;
 
+/*
+ * 独立语音边沿队列：控制报告与键盘 0x3E 按 HID 回调到达顺序汇合。
+ * 只合并同一 (peer, source) 的重复同状态；相反 down/up 必须都保留。
+ * 入队、逐条处理和断链清理共用一把互斥量，避免旧批次在断链后产生幽灵按下。
+ */
+typedef struct {
+    int8_t peer_idx;
+    uint8_t source;   /* BR_VOICE_INPUT_CONTROL / BR_VOICE_INPUT_KEYBOARD */
+    bool down;
+} voice_item_t;
+
+#define VOICEQ_LEN 16
+static voice_item_t s_voice_items[VOICEQ_LEN];
+static int s_voice_count;
+static SemaphoreHandle_t s_voice_process_lock;
+
+static const char *voice_source_name(uint8_t source)
+{
+    return source == BR_VOICE_INPUT_KEYBOARD ? "xiaomi_key" : "xiaomi_control";
+}
+
+/* ATVV 与小米共用 EV VOICE；sent 只在本次确实新获得热键时为 1。 */
+static void emit_voice_event(int8_t peer_idx, bool sent, const char *src,
+                             uint32_t now_ms)
+{
+    if (peer_idx < 0 || peer_idx >= BR_MAX_PEERS) {
+        return;
+    }
+    uint8_t vmods = 0, vcount = 0, vkeys[6] = {0};
+    br_voice_get_hotkey(&vmods, vkeys, &vcount);
+    const uint8_t *addr = s_peers[peer_idx].map_addr_valid
+                            ? s_peers[peer_idx].map_addr
+                            : s_peers[peer_idx].addr;
+    char vaddr[18];
+    addr_to_str(addr, vaddr, sizeof(vaddr));
+    br_kv_t vkv;
+    br_kv_init(&vkv);
+    br_kv_add_int(&vkv, "idx", peer_idx);
+    br_kv_add(&vkv, "addr", vaddr);
+    br_kv_add_int(&vkv, "sent", sent ? 1 : 0);
+    br_kv_add_int(&vkv, "on", br_voice_enabled() ? 1 : 0);
+    br_kv_add_int(&vkv, "mods", vmods);
+    br_kv_add_hex(&vkv, "keys", vkeys, vcount);
+    if (src) {
+        br_kv_add(&vkv, "src", src);
+    }
+    br_kv_add_int(&vkv, "t", (int)now_ms);
+    br_proto_send_ev("VOICE", &vkv);
+}
+
+static void voice_queue_enqueue(int8_t peer_idx, uint8_t source, bool down);
+
+static void on_hid_voice(int8_t peer_idx, bool down, void *ctx)
+{
+    (void)ctx;
+    voice_queue_enqueue(peer_idx, BR_VOICE_INPUT_CONTROL, down);
+}
+
+static void voice_queue_enqueue(int8_t peer_idx, uint8_t source, bool down)
+{
+    if (peer_idx < 0 || peer_idx >= BR_MAX_PEERS) {
+        return;
+    }
+    xSemaphoreTake(s_voice_process_lock, portMAX_DELAY);
+    if (!s_peers[peer_idx].used || !s_peers[peer_idx].connected ||
+        !s_peers[peer_idx].xiaomi) {
+        xSemaphoreGive(s_voice_process_lock);
+        return;
+    }
+
+    voice_item_t item = {
+        .peer_idx = peer_idx,
+        .source = source,
+        .down = down,
+    };
+    bool rejected = false;
+    for (int i = s_voice_count - 1; i >= 0; i--) {
+        if (s_voice_items[i].peer_idx == item.peer_idx &&
+            s_voice_items[i].source == item.source) {
+            if (s_voice_items[i].down == item.down) {
+                xSemaphoreGive(s_voice_process_lock);
+                return;
+            }
+            break;
+        }
+    }
+    if (s_voice_count >= VOICEQ_LEN) {
+        int drop = -1;
+        for (int i = 0; i < VOICEQ_LEN; i++) {
+            if (s_voice_items[i].down) {
+                drop = i;
+                break;
+            }
+        }
+        if (drop < 0) {
+            rejected = true;
+        } else {
+            memmove(&s_voice_items[drop], &s_voice_items[drop + 1],
+                    (size_t)(s_voice_count - drop - 1) * sizeof(s_voice_items[0]));
+            s_voice_count--;
+        }
+    }
+    if (!rejected) {
+        s_voice_items[s_voice_count++] = item;
+    } else {
+        ESP_LOGW(TAG, "语音队列已满且没有可丢的 down，拒绝事件 peer=%d down=%d",
+                 peer_idx, down ? 1 : 0);
+    }
+    xSemaphoreGive(s_voice_process_lock);
+}
+
+static void voice_queue_peer_reset_locked(int8_t peer_idx)
+{
+    int kept = 0;
+    for (int i = 0; i < s_voice_count; i++) {
+        if (s_voice_items[i].peer_idx != peer_idx) {
+            s_voice_items[kept++] = s_voice_items[i];
+        }
+    }
+    s_voice_count = kept;
+}
+
+static void handle_xiaomi_voice_result(int8_t peer_idx, uint8_t source,
+                                       br_voice_input_result_t result,
+                                       uint32_t now_ms)
+{
+    if (result == BR_VOICE_INPUT_PRESSED) {
+        bool sent = br_voice_xiaomi_press(peer_idx);
+        emit_voice_event(peer_idx, sent, voice_source_name(source), now_ms);
+    } else if (result == BR_VOICE_INPUT_RELEASED) {
+        br_voice_xiaomi_release(peer_idx);
+        ESP_LOGI(TAG, "小米语音释放 peer=%d src=%s",
+                 peer_idx, voice_source_name(source));
+    }
+}
+
+static void drain_voice_queue(uint32_t now_ms)
+{
+    for (;;) {
+        xSemaphoreTake(s_voice_process_lock, portMAX_DELAY);
+        if (s_voice_count == 0) {
+            int8_t active_peer = br_voice_input_peer();
+            if (br_voice_input_tick(now_ms) == BR_VOICE_INPUT_RELEASED) {
+                handle_xiaomi_voice_result(active_peer, BR_VOICE_INPUT_CONTROL,
+                                           BR_VOICE_INPUT_RELEASED, now_ms);
+                ESP_LOGI(TAG, "小米双信号释放宽限超时 peer=%d", active_peer);
+            }
+            xSemaphoreGive(s_voice_process_lock);
+            return;
+        }
+
+        voice_item_t item = s_voice_items[0];
+        memmove(&s_voice_items[0], &s_voice_items[1],
+                (size_t)(s_voice_count - 1) * sizeof(s_voice_items[0]));
+        s_voice_count--;
+        if (item.peer_idx < 0 || item.peer_idx >= BR_MAX_PEERS ||
+            !s_peers[item.peer_idx].used ||
+            !s_peers[item.peer_idx].connected ||
+            !s_peers[item.peer_idx].xiaomi) {
+            xSemaphoreGive(s_voice_process_lock);
+            continue;
+        }
+
+        br_voice_input_result_t result = br_voice_input_update(
+            item.peer_idx, (br_voice_input_source_t)item.source,
+            item.down, now_ms);
+        handle_xiaomi_voice_result(item.peer_idx, item.source, result, now_ms);
+        xSemaphoreGive(s_voice_process_lock);
+    }
+}
+
 /* 学习模式：开启后按下的第一个键单独上报为 LEARN 事件 */
 static bool s_learn_mode = false;
 static int  s_learn_idx = -1;
@@ -433,15 +628,6 @@ static int  s_learn_idx = -1;
 static void on_hid_key(const br_hid_key_t *key, void *ctx)
 {
     (void)ctx;
-    if (!s_keyq) {
-        return;
-    }
-
-    /*
-     * ★ LED 反馈 ★
-     *   按下 -> 亮蓝，松开 -> 熄灭。
-     *   用户靠这个判断「开发板到底有没有收到按键」。
-     */
     if (key->down) {
         bridge_led_key_down();
     } else {
@@ -449,6 +635,15 @@ static void on_hid_key(const br_hid_key_t *key, void *ctx)
     }
 
     br_hid_key_t k = *key;
+    if (k.peer_idx >= 0 && k.peer_idx < BR_MAX_PEERS &&
+        s_peers[k.peer_idx].connected && s_peers[k.peer_idx].xiaomi &&
+        k.src == BR_SRC_KEYBOARD && k.usage == 0x3E) {
+        voice_queue_enqueue((int8_t)k.peer_idx, BR_VOICE_INPUT_KEYBOARD, k.down);
+        return;
+    }
+    if (!s_keyq) {
+        return;
+    }
     if (xQueueSend(s_keyq, &k, 0) != pdTRUE) {
         br_hid_key_t drop;
         xQueueReceive(s_keyq, &drop, 0);
@@ -633,16 +828,51 @@ static bool name_contains_ci(const char *hay, const char *needle)
     return false;
 }
 
+/*
+ * ★ 已知遥控器的广播名 token ★
+ *
+ * 配对窗口只认这些名字（外加配对表里登记过的）。
+ * token 要挑得够窄 —— 「miio」这种小米家居设备的通用前缀不能收，
+ * 否则音箱、扫地机都会被抓去配对。
+ */
+static const char *const k_remote_name_tokens[] = {
+    /* 谷歌 Chromecast / Google TV */
+    "chromecast",
+    "hid_device",
+    "google tv",
+    /* 小米蓝牙语音遥控器（含 MI RC / Xiaomi Bluetooth Remote） */
+    "小米",
+    "mi rc",
+    "xiaomi remote",
+    "xiaomi bluetooth remote",
+};
+
+/**
+ * 这个名字是不是小米那台语音遥控器？
+ *
+ * 小米一代的语音走 HID 报告（不是 ATVV），
+ * 它的音频报告必须订阅才能拿到 —— 见 br_hid_set_xiaomi()。
+ */
+static bool is_xiaomi_name(const char *name)
+{
+    if (!name || !name[0]) {
+        return false;
+    }
+    return name_contains_ci(name, "小米") ||
+           name_contains_ci(name, "mi rc") ||
+           name_contains_ci(name, "xiaomi remote") ||
+           name_contains_ci(name, "xiaomi bluetooth remote");
+}
+
 static bool looks_like_remote(const char *name)
 {
     if (!name || !name[0]) {
         return false;
     }
-    /* 谷歌遥控器的广播名 */
-    if (name_contains_ci(name, "chromecast") ||
-        name_contains_ci(name, "hid_device") ||
-        name_contains_ci(name, "google tv")) {
-        return true;
+    for (size_t i = 0; i < sizeof(k_remote_name_tokens) / sizeof(k_remote_name_tokens[0]); i++) {
+        if (name_contains_ci(name, k_remote_name_tokens[i])) {
+            return true;
+        }
     }
     /* 配对表里出现过的名字 —— 那是用户以前配过的那台 */
     int n = pl_count();
@@ -739,7 +969,7 @@ void br_addr_to_str(const uint8_t *addr, char *out, size_t cap)
 }
 
 /*
- * ★★★ 把 "7E:A2:99:61:45:FE" 解析回 NimBLE 的字节序 ★★★
+ * ★★★ 把 "7E:A2:AA:BB:CC:02" 解析回 NimBLE 的字节序 ★★★
  *
  * NimBLE 的 ble_addr_t.val 是**小端**：val[5] 才是打印出来的第一字节。
  * 所以这里必须 out[5 - i] = v[i]。
@@ -872,6 +1102,7 @@ static int alloc_peer(void)
     for (int i = 0; i < BR_MAX_PEERS; i++) {
         if (!s_peers[i].used) {
             memset(&s_peers[i], 0, sizeof(s_peers[i]));
+            s_peers[i].generation = ++s_next_peer_generation;
             s_peers[i].used = true;
             s_peers[i].idx = (uint8_t)i;
             s_peers[i].disc_state = BR_DISC_NONE;
@@ -911,6 +1142,7 @@ static int alloc_peer(void)
     }
     ESP_LOGW(TAG, "peer 槽位用完，回收最久没动静的槽 %d", victim);
     memset(&s_peers[victim], 0, sizeof(s_peers[victim]));
+    s_peers[victim].generation = ++s_next_peer_generation;
     s_peers[victim].used = true;
     s_peers[victim].idx = (uint8_t)victim;
     s_peers[victim].disc_state = BR_DISC_NONE;
@@ -1909,8 +2141,77 @@ static void open_channels(int peer_idx)
     }
     p->channels_open = true;
     p->channels_enc = p->encrypted;
+    /*
+     * ★ 再要一次 MTU（加密之后）★
+     *
+     * 连接建立时发的那次 ATT_MTU_REQ，对端经常不回（它还没准备好配对），
+     * 于是 MTU 停在默认的 23 —— **ATT 通知最大只能带 20 字节**。
+     * 小米旧固件变体的语音音频一包可能为 60 字节，MTU 23 时无法发送。
+     * 旧采样受探针并发 GATT 操作干扰，只观察到 20 字节控制包；
+     * 不能据此判定设备没有音频。加密完成后再请求一次 MTU。
+     */
+    if (p->encrypted && !p->mtu_requested) {
+        p->mtu_requested = true;
+        ble_gattc_exchange_mtu(p->conn_handle, NULL, NULL);
+        ESP_LOGI(TAG, "加密完成后重新请求 MTU");
+    }
     if (p->atvv_seen) {
         subscribe_atvv(peer_idx);
+    }
+    /*
+     * ★ 小米遥控器：把「数据通道」也订上 ★
+     *
+     * 小米一代的语音音频是走 HID 报告里的大包（不是 ATVV），
+     * 那条报告会被 Report Map 判成 DATA/VENDOR 角色 ——
+     * 默认是不订阅的（CMCC v3 实测订了会顶断链路），
+     * 所以这里只对小米这一台放开。
+     *
+     * ★ 名字可能为空 ★
+     *   按地址重连回来时广播名常常是空的（这轮广播没带名字）。
+     *   所以名字认不出就查配对表里记住的档案 id（"xiaomi"）。
+     */
+    {
+        bool xiaomi = is_xiaomi_name(p->name);
+        if (!xiaomi) {
+            int slot = pl_find(p->addr);
+            if (slot < 0 && p->has_id) {
+                slot = pl_find_by_id(p->id_addr);
+            }
+            if (slot >= 0) {
+                char prof[16] = "";
+                if (pl_get_profile(slot, prof, sizeof(prof)) &&
+                    strcmp(prof, "xiaomi") == 0) {
+                    xiaomi = true;
+                }
+                /* 配对表里存的名字（配对那次广播名是有的） */
+                if (!xiaomi) {
+                    uint8_t a[6];
+                    uint8_t t;
+                    char nm[BR_MAX_NAME_LEN];
+                    if (pl_get(slot, a, &t, nm, sizeof(nm)) &&
+                        is_xiaomi_name(nm)) {
+                        xiaomi = true;
+                    }
+                }
+            }
+        }
+        br_hid_set_xiaomi(peer_idx, xiaomi);
+        p->xiaomi = xiaomi;
+        if (xiaomi) {
+            /* 60 字节 ATT 通知要求 LL Rx payload >= 67；主动触发标准 DLE 协商。 */
+            int rc = ble_gap_set_data_len(p->conn_handle, 251, 2120);
+            ESP_LOGI(TAG, "小米语音请求 DLE peer=%d rc=%d", peer_idx, rc);
+            br_kv_t kv;
+            br_kv_init(&kv);
+            br_kv_add_int(&kv, "idx", peer_idx);
+            br_kv_add_int(&kv, "rc", rc);
+            br_proto_send_ev("DLEREQ", &kv);
+        }
+        if (xiaomi && !p->fast_params) {
+            p->fast_params = true;
+            p->params_pending = true;
+            ESP_LOGI(TAG, "小米 HID 语音改用低延迟连接参数 peer=%d", peer_idx);
+        }
     }
     /* GATT 摸清了，接着去找 HID 报告特征并订阅 */
     br_hid_begin(peer_idx, p->conn_handle);
@@ -2039,19 +2340,23 @@ static void request_conn_params(br_peer_t *p)
 {
     struct ble_gap_upd_params params;
     memset(&params, 0, sizeof(params));
-    params.itvl_min = 24;              /* 30ms */
-    params.itvl_max = 24;              /* 30ms */
+    params.itvl_min = p->fast_params ? 6 : 24;   /* 7.5ms / 30ms */
+    params.itvl_max = p->fast_params ? 6 : 24;
     /*
      * ★ latency 不能给 50 ★
      *
-     *   50 × 30ms = 1.5 秒从机可以不响应。
-     *   单台时没问题，**两台同时连着就撑不住**：
-     *   加上 WiFi 抢射频，链路直接报 LL Response Timeout 被断
+     *   两台同时连着就撑不住：加上 WiFi 抢射频，链路直接报 LL Response Timeout 被断
      *   （HCI 0x22）—— 症状就是「配了第二台，第一台按键就失效」。
-     *   改成 8（约 240ms）：还省电，但链路稳得住。
+     *   普通遥控器改成 8（约 240ms）：还省电，但链路稳得住。
+     *   小米 HID 语音必须用 0，否则 133 帧/秒的音频没有发送窗口。
      */
-    params.latency = 8;
-    params.supervision_timeout = 500;  /* 5 秒 */
+    /*
+     * Windows 注册表记录的小米协商结果就是 7.5ms / latency 299 / 12s。
+     * 固件实测也会主动请求 latency=299；强行改成 0 虽然按键仍可用，
+     * 但语音固件不肯开始 60 字节音频流。这里与 Windows 保持一致。
+     */
+    params.latency = p->fast_params ? 299 : 8;
+    params.supervision_timeout = p->fast_params ? 1200 : 500;
     params.min_ce_len = 0;
     params.max_ce_len = 0;
 
@@ -2178,7 +2483,6 @@ static int  pl_find(const uint8_t *addr);
 static int  pl_find_by_id(const uint8_t *id);
 static bool pl_get_profile(int i, char *out, size_t cap);
 static bool pl_set_profile(int i, const char *id);
-static void drop_orphan_bonds(void);
 static bool pl_set_id(const uint8_t *addr, const uint8_t *id_addr,
                       uint8_t id_type);
 
@@ -2368,6 +2672,32 @@ static int conn_event(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        int idx = find_peer_by_conn(event->conn_update.conn_handle);
+        br_peer_t *p = idx >= 0 ? &s_peers[idx] : NULL;
+        struct ble_gap_conn_desc desc;
+        if (p && ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+            ESP_LOGI(TAG,
+                     "连接参数已更新 peer=%d itvl=%.2fms lat=%u to=%ums status=%d",
+                     idx, desc.conn_itvl * 1.25,
+                     (unsigned)desc.conn_latency,
+                     (unsigned)desc.supervision_timeout * 10,
+                     event->conn_update.status);
+            int64_t now = esp_timer_get_time();
+            if (event->conn_update.status == 0 && p->fast_params &&
+                (desc.conn_itvl != 6 || desc.conn_latency != 299 ||
+                 desc.supervision_timeout != 1200) &&
+                now >= p->next_params_retry_us) {
+                p->params_pending = true;
+                p->next_params_retry_us = now + 1000000;
+                ESP_LOGW(TAG,
+                         "小米语音参数被对端改坏，1 秒后重新请求 peer=%d",
+                         idx);
+            }
+        }
+        return 0;
+    }
+
     case BLE_GAP_EVENT_IDENTITY_RESOLVED: {
         /*
          * ★ identity 地址（固定 MAC）到手的时刻 ★
@@ -2397,12 +2727,13 @@ static int conn_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT: {
         s_connect_in_progress = false;
-        /* ★ 断链必须放掉语音热键 ★
-           否则 Ctrl+Win 会一直按在 PC 上，整台电脑的键盘都变成快捷键。 */
-        br_voice_on_disconnect();
         int idx = find_peer_by_conn(event->disconnect.conn.conn_handle);
         if (idx >= 0) {
+            xSemaphoreTake(s_voice_process_lock, portMAX_DELAY);
             s_peers[idx].connected = false;
+            voice_queue_peer_reset_locked((int8_t)idx);
+            br_voice_on_disconnect(idx);
+            xSemaphoreGive(s_voice_process_lock);
             s_peers[idx].disc_state = BR_DISC_NONE;
             /*
              * ★ HID 上下文必须跟着断链一起清 ★
@@ -2479,7 +2810,34 @@ static int conn_event(struct ble_gap_event *event, void *arg)
             br_kv_add(&kv, "why", desc);
             br_kv_add_int(&kv, "enc", st == 0 ? 1 : 0);
             br_proto_send_ev("ENC", &kv);
+            if (st == 0) {
+                struct ble_gap_conn_desc sd;
+                if (ble_gap_conn_find(event->enc_change.conn_handle, &sd) == 0) {
+                    ESP_LOGI(TAG,
+                             "链路安全: bonded=%u authenticated=%u key_size=%u",
+                             sd.sec_state.bonded, sd.sec_state.authenticated,
+                             sd.sec_state.key_size);
+                }
+                if (s_peers[idx].xiaomi && !s_peers[idx].phy_requested) {
+                    s_peers[idx].phy_requested = true;
+                    int rc = ble_gap_set_prefered_le_phy(
+                        event->enc_change.conn_handle,
+                        BLE_HCI_LE_PHY_2M_PREF_MASK,
+                        BLE_HCI_LE_PHY_2M_PREF_MASK, 0);
+                    ESP_LOGI(TAG, "请求 2M PHY rc=%d", rc);
+                }
+            }
             open_channels(idx);
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE: {
+        int idx = find_peer_by_conn(event->phy_updated.conn_handle);
+        if (idx >= 0) {
+            ESP_LOGI(TAG, "PHY 更新: status=%u tx=%u rx=%u",
+                     event->phy_updated.status, event->phy_updated.tx_phy,
+                     event->phy_updated.rx_phy);
         }
         return 0;
     }
@@ -2493,6 +2851,28 @@ static int conn_event(struct ble_gap_event *event, void *arg)
             br_kv_add_int(&kv, "idx", idx);
             br_kv_add_int(&kv, "mtu", event->mtu.value);
             br_proto_send_ev("MTU", &kv);
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_DATA_LEN_CHG: {
+        int idx = find_peer_by_conn(event->data_len_chg.conn_handle);
+        if (idx >= 0) {
+            ESP_LOGI(TAG,
+                     "DLE handle=%u tx=%u/%uus rx=%u/%uus",
+                     event->data_len_chg.conn_handle,
+                     event->data_len_chg.max_tx_octets,
+                     event->data_len_chg.max_tx_time,
+                     event->data_len_chg.max_rx_octets,
+                     event->data_len_chg.max_rx_time);
+            br_kv_t kv;
+            br_kv_init(&kv);
+            br_kv_add_int(&kv, "idx", idx);
+            br_kv_add_int(&kv, "tx_octets", event->data_len_chg.max_tx_octets);
+            br_kv_add_int(&kv, "tx_time", event->data_len_chg.max_tx_time);
+            br_kv_add_int(&kv, "rx_octets", event->data_len_chg.max_rx_octets);
+            br_kv_add_int(&kv, "rx_time", event->data_len_chg.max_rx_time);
+            br_proto_send_ev("DLE", &kv);
         }
         return 0;
     }
@@ -2542,6 +2922,7 @@ static int conn_event(struct ble_gap_event *event, void *arg)
         item.attr = attr;
         item.len = n;
         item.peer = (int8_t)idx;   /* ★ 记下是哪台，别靠句柄反查 ★ */
+        item.generation = s_peers[idx].generation;
         memcpy(item.data, OS_MBUF_DATA(dup, uint8_t *), n);
 
         /* 队列满：丢最旧的一条，优先保新数据（音频流后面才是当前语音） */
@@ -2962,37 +3343,6 @@ static int pl_count(void)
         }
     }
     return n;
-}
-
-/**
- * 清理孤 bond。
- *
- * ★ 这就是「删掉配对后再配对一直连不上」的根因 ★
- *
- *   配对表（pl）是「已配对遥控器」的权威名单，
- *   bond 表只是 NimBLE 存着的密钥。
- *   名单空了、bond 还留着 →
- *     · 板子一直去连那几台（连上也用不上，因为不在名单里）
- *     · 遥控器那边也还留着旧 bond → 重新配对时双方都有旧密钥，
- *       配对流程走不下去，表现为「板子闪蓝灯、遥控器进配对模式，
- *       两者一直建不起连接」，只能两个口都拔掉重插。
- *
- *   所以：名单一空，就把没有对应名单的 bond 全部清掉。
- */
-/*
- * ★ 这段（清孤 bond）撤掉了 ★
- *
- *   原来的想法：配对表空了就把没对应的 bond 清掉。
- *   实测两处不对：
- *     · 配对表空是**暂时的**（用户刚删掉、正在重新配对），
- *       这时把 bond 清了，板子就再也找不到那台遥控器了；
- *     · 刚配对成功的那一瞬，配对表还没写进去，
- *       bond 先被清掉 → 配了个寂寞。
- *   bond 表正是「板子怎么找到遥控器」的凭据，**不能随便清**。
- */
-static void drop_orphan_bonds(void)
-{
-    /* 保留：不做任何清理。 */
 }
 
 /**
@@ -3562,6 +3912,21 @@ int br_ble_list_remotes(void)
         br_kv_add_int(&kv, "conn", conn ? 1 : 0);
         br_kv_add_int(&kv, "voice", voice ? 1 : 0);
         br_kv_add_int(&kv, "bonded", bonded_flag);
+        /*
+         * ★ kind = 遥控器型号档案 id ★
+         *   PC 端按它决定用哪套键位档案（谷歌 / 小米 / 手机）。
+         *   先取配对表里记住的档案 id，没记住就按名字现推。
+         */
+        {
+            char prof[16] = "";
+            if (!pl_get_profile(i, prof, sizeof(prof)) || !prof[0]) {
+                const char *pid = br_mapping_profile_id_for_name(live_name);
+                if (pid) {
+                    snprintf(prof, sizeof(prof), "%s", pid);
+                }
+            }
+            br_kv_add(&kv, "kind", prof[0] ? prof : "chromecast");
+        }
         /* identity（固定 MAC）：PC 端按它归档映射，刷完固件后能认出同一台 */
         br_kv_add(&kv, "id", id_s);
         /* 真实映射条数（以前写死 0，界面永远显示「已配 0 条映射」） */
@@ -3815,9 +4180,27 @@ void br_ble_set_target_name(const char *substr)
 
 /* ------------------------------------------------------------ 诊断接口 */
 
-void br_ble_gatt_dump(int peer_idx)
+/**
+ * 重跑一遍 HID 订阅流程（取证用）。
+ *
+ * 用途：小米一代的语音音频装在「数据通道」报告里，
+ * 默认不订阅；取证时用 HIDDATA 打开后要重新订一遍才会来通知。
+ */
+bool br_ble_hid_resubscribe(int peer_idx)
 {
     if (peer_idx < 0 || peer_idx >= BR_MAX_PEERS) {
+        return false;
+    }
+    br_peer_t *p = &s_peers[peer_idx];
+    if (!p->used || !p->connected) {
+        return false;
+    }
+    br_hid_begin(peer_idx, p->conn_handle);
+    return true;
+}
+
+void br_ble_gatt_dump(int peer_idx)
+{    if (peer_idx < 0 || peer_idx >= BR_MAX_PEERS) {
         return;
     }
     br_peer_t *p = &s_peers[peer_idx];
@@ -4102,6 +4485,34 @@ static void br_ble_task(void *arg)
                     s_peers[i].params_pending = false;
                     request_conn_params(&s_peers[i]);
                 }
+                /*
+                 * ★ MTU 一直协商不下来就反复要 ★
+                 *
+                 * 小米旧固件变体的语音音频一包可能为 60 字节 ——
+                 * ATT 通知最大只能带 (MTU-3) 字节，
+                 * MTU 停在 23 时它无法发送。
+                 * 旧采样受探针并发 GATT 操作干扰，只观察到 20 字节控制包，
+                 * 不能据此判定设备没有音频。
+                 *
+                 * 连接建立时发的那次 ATT_MTU_REQ，对端经常不回；
+                 * 加密完成后补发一次还是可能丢 —— 这里每隔 2 秒重试，
+                 * 最多 6 次，并把实际协商到的 MTU 打到日志里。
+                 */
+                if (s_peers[i].mtu_retry < 6 &&
+                    now > s_peers[i].next_mtu_retry_us) {
+                    uint16_t mtu = ble_att_mtu(s_peers[i].conn_handle);
+                    if (mtu > 23) {
+                        ESP_LOGI(TAG, "MTU 已经是 %u，不用再要", mtu);
+                        s_peers[i].mtu_retry = 6;
+                    } else {
+                        s_peers[i].mtu_retry++;
+                        s_peers[i].next_mtu_retry_us = now + 2000000;
+                        int rc = ble_gattc_exchange_mtu(
+                            s_peers[i].conn_handle, NULL, NULL);
+                        ESP_LOGI(TAG, "请求 MTU 第 %d 次 rc=%d（当前 %u）",
+                                 s_peers[i].mtu_retry, rc, mtu);
+                    }
+                }
                 disc_drive(i);
                 br_hid_drive(i, s_peers[i].conn_handle);
                 /* ATVV 的 CCCD 也要真写（对端才知道要发） */
@@ -4131,12 +4542,27 @@ static void br_ble_task(void *arg)
         }
 
         /*
+         * ★ 语音边沿先于普通按键队列处理 ★
+         * 控制报告的 press/release 不能被键盘队列里的普通事件淹没。
+         */
+        uint32_t now_ms = (uint32_t)(now / 1000);
+        drain_voice_queue(now_ms);
+
+        /*
          * ★ 把按键事件发成协议行 ★
          */
         if (s_keyq) {
             br_hid_key_t k;
             int n = 0;
             while (n < 32 && xQueueReceive(s_keyq, &k, 0) == pdTRUE) {
+                /* 小米 0x3E 已在 HID 回调进入语音队列；这里只兜底消费旧残留。 */
+                if (k.peer_idx >= 0 && k.peer_idx < BR_MAX_PEERS &&
+                    s_peers[k.peer_idx].xiaomi &&
+                    k.src == BR_SRC_KEYBOARD && k.usage == 0x3E) {
+                    n++;
+                    continue;
+                }
+
                 /*
                  * 学习模式：按下的那一个键单独上报为 LEARN，
                  * 并且**退出学习模式**（学一个就够）。
@@ -4245,6 +4671,7 @@ static void br_ble_task(void *arg)
             au_item_t item;
             int drained = 0;
             while (drained < 32 && xQueueReceive(s_auq, &item, 0) == pdTRUE) {
+                drained++;
                 /*
                  * ★ 用入队时记下的 peer，别用句柄反查 ★
                  *   两台遥控器同时连着时特征句柄会撞车，
@@ -4252,12 +4679,19 @@ static void br_ble_task(void *arg)
                  */
                 int idx = (item.peer >= 0 && item.peer < BR_MAX_PEERS)
                               ? (int)item.peer : -1;
+                if (idx < 0 || !s_peers[idx].used || !s_peers[idx].connected ||
+                    item.generation != s_peers[idx].generation) {
+                    continue;
+                }
                 const char *kind = "NT";
                 if (idx >= 0 && s_peers[idx].used && s_peers[idx].connected) {
                     if (s_peers[idx].atvv_audio_handle == item.attr) {
                         kind = "AU";
                     } else if (s_peers[idx].atvv_ctl_handle == item.attr) {
                         kind = "CTL";
+                    } else if (s_peers[idx].xiaomi &&
+                               br_msbc_frame_ok(item.data, item.len)) {
+                        kind = "XAU";
                     }
                 }
 
@@ -4266,44 +4700,28 @@ static void br_ble_task(void *arg)
                 br_kv_add_int(&kv, "idx", idx);
                 br_kv_add_int(&kv, "h", item.attr);
                 br_kv_add_int(&kv, "n", item.len);
-                if (strcmp(kind, "CTL") == 0) {
-                    bool voice_pressed = br_voice_control(item.data, item.len);
+                if (strcmp(kind, "XAU") == 0) {
+                    br_voice_xiaomi_audio(item.data, item.len, (int8_t)idx);
+                } else if (strcmp(kind, "CTL") == 0) {
+                    bool voice_pressed = br_voice_control(item.data, item.len,
+                                                          (int8_t)idx);
                     br_kv_add_hex(&kv, "hex", item.data, item.len);
                     br_proto_send_dt(kind, &kv);
                     /*
-                     * ★ AUDIO_START = 遥控器的语音键真的按下了 ★
-                     *   板子这会儿正替 PC 按语音快捷键（默认 左Ctrl+左Win）。
-                     *   单独报一条事件，PC 端就能显示
-                     *   「客厅遥控器 按下语音键 → 板子按出 左Ctrl+左Win」，
-                     *   用户一眼看出到底是没收到还是输入法没反应。
-                     *
-                     * ★ sent / on 必报 ★
-                     *   以前这条事件无条件发，语音通道被关掉时也照样发 ——
-                     *   用户看日志以为板子按了热键，其实一个字都没按出去。
+                     * AUDIO_START = 遥控器的语音键真的按下了。
+                     * sent/on/mods/keys 都由实际热键状态生成，禁用或竞争失败
+                     * 时 sent=0，不再把「收到起始帧」谎报成「已按下热键」。
                      */
                     if (item.len > 0 && item.data[0] == 0x04 && idx >= 0) {
-                        uint8_t vmods = 0, vcount = 0, vkeys[6] = {0};
-                        br_voice_get_hotkey(&vmods, vkeys, &vcount);
-                        char vaddr[18];
-                        addr_to_str(s_peers[idx].addr, vaddr, sizeof(vaddr));
-                        br_kv_t vkv; br_kv_init(&vkv);
-                        br_kv_add_int(&vkv, "idx", idx);
-                        br_kv_add(&vkv, "addr", vaddr);
-                        br_kv_add_int(&vkv, "sent", voice_pressed ? 1 : 0);
-                        br_kv_add_int(&vkv, "on", br_voice_enabled() ? 1 : 0);
-                        br_kv_add_int(&vkv, "mods", vmods);
-                        br_kv_add_hex(&vkv, "keys", vkeys, vcount);
-                        br_kv_add_int(&vkv, "t",
-                                      (int)(esp_timer_get_time() / 1000));
-                        br_proto_send_ev("VOICE", &vkv);
+                        emit_voice_event((int8_t)idx, voice_pressed, "atvv",
+                                         (uint32_t)(esp_timer_get_time() / 1000));
                     }
                 } else if (strcmp(kind, "AU") == 0) {
-                    br_voice_audio(item.data, item.len);
+                    br_voice_audio(item.data, item.len, (int8_t)idx);
                     if (bridge_usb_cdc_connected()) {
                         br_proto_send_dt(kind, &kv);
                     }
                 }
-                drained++;
             }
         }
 
@@ -4705,6 +5123,14 @@ esp_err_t br_ble_init(void)
     s_peer_count = 0;
     s_candidate_count = 0;
 
+    if (!s_voice_process_lock) {
+        s_voice_process_lock = xSemaphoreCreateMutex();
+        if (!s_voice_process_lock) {
+            ESP_LOGE(TAG, "voice process lock alloc failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     /*
      * ★★★ 顺序很重要：先配 ble_hs_cfg，再 nimble_port_init() ★★★
      *   nimble_port_init() 会触发 host 与控制器同步，
@@ -4755,6 +5181,7 @@ esp_err_t br_ble_init(void)
         }
         br_hid_set_key_handler(on_hid_key, NULL);
     }
+    br_hid_set_voice_handler(on_hid_voice, NULL);
     br_hid_reset();
 
     /*

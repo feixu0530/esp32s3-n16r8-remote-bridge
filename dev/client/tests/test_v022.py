@@ -112,9 +112,9 @@ def test_voice_state_pushed_on_connect() -> None:
 
     core = (FW_MAIN / "br_ble_core.c").read_text(encoding="utf-8")
     check("语音事件带 sent（有没有真的按出去）",
-          '"sent", voice_pressed ? 1 : 0' in core, "")
+          'br_kv_add_int(&vkv, "sent", sent ? 1 : 0);' in core, "")
     check("语音事件带 on（通道开没开）",
-          '"on", br_voice_enabled() ? 1 : 0' in core, "")
+          'br_kv_add_int(&vkv, "on", br_voice_enabled() ? 1 : 0);' in core, "")
 
 
 def test_voice_log_tells_truth() -> None:

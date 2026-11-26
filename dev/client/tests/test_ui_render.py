@@ -319,6 +319,45 @@ def main() -> int:
                                lambda: len(items_named(
                                    win.contentItem(), "renameRemote")) == 2))
 
+    # ---------------------------------------------------------- 小米遥控器布局
+    print("")
+    print("[小米遥控器布局]")
+    controller._cfg["remotes"] = [{
+        "addr": "44:28:AA:BB:CC:01", "identity": "44:28:AA:BB:CC:01",
+        "type": 0, "name": "MI RC", "image": "", "markers": [],
+        "kind": "xiaomi",
+        "bindings": {"bindings": {}, "secondary_bindings": {}},
+    }]
+    controller.selectRemote(0)
+    win.setProperty("currentPage", 1)
+    pump(16)
+
+    check("小米遥控器用的是小米那张实物图",
+          controller.remoteImageSource(0).endswith("Xiaomi-remote.png"),
+          controller.remoteImageSource(0))
+    xiaomi_spots = controller.hotspots
+    check("小米热点 12 个（含语音键）",
+          len(xiaomi_spots) == 12, str(len(xiaomi_spots)))
+    check("小米热点里有一个语音键",
+          sum(1 for s in xiaomi_spots if s.get("is_voice")) == 1,
+          str([s["button_id"] for s in xiaomi_spots]))
+    check("小米热点坐标都在图内",
+          all(0 <= s["x"] <= 1 and 0 <= s["y"] <= 1
+              and 0 < s["width"] <= 1 and 0 < s["height"] <= 1
+              for s in xiaomi_spots),
+          str(xiaomi_spots[:2]))
+    x_rows = [r["button_id"] for r in controller.buttonList]
+    check("小米按键行 12 个",
+          len(x_rows) == 12, str(x_rows))
+    check("小米按键行含语音键",
+          "mic" in x_rows, str(x_rows))
+    up_card = items_named(win.contentItem(), "mappingKeyCell_up")
+    check("小米的「上」卡片存在", bool(up_card))
+    missing_x = items_named(win.contentItem(), "photoMissingHint")
+    check("小米布局不显示「实物图缺失」提示",
+          not missing_x or not bool(missing_x[0].property("visible")))
+    win.grabWindow().save(str(out_dir / "ui_xiaomi_keys.png"))
+
     # ---------------------------------------------------------- 手机布局 · 自定义键
     print("")
     print("[手机布局 · 自定义键]")

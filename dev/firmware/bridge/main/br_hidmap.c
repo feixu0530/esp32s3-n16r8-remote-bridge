@@ -74,13 +74,6 @@ void br_hidmap_reset(br_hidmap_t *map)
     memset(map, 0, sizeof(*map));
 }
 
-static void map_entry(br_hidmap_t *map, uint8_t report_id)
-{
-    if (report_id < BR_HIDMAP_MAX_REPORTS) {
-        map->entries[report_id].seen = true;
-    }
-}
-
 /**
  * Collection 作用域栈。
  *
@@ -223,7 +216,13 @@ int br_hidmap_parse(br_hidmap_t *map, const uint8_t *report_map, uint16_t len)
             }
         } else {  /* MAIN */
             if (b_tag == TAG_INPUT) {
-                map_entry(map, report_id);
+                /*
+                 * ★ 顺序很重要 ★
+                 * map_entry() 会把 seen 置真 —— 如果先调它，
+                 * 下面 `if (!e->seen)` 就永远不成立，page/usage 永远记不上，
+                 * 于是**所有报告的角色都是 NONE**（小米实测：键盘报告也一样）。
+                 * 所以先做「首次见到」的赋值，再标记 seen。
+                 */
                 if (report_id < BR_HIDMAP_MAX_REPORTS) {
                     br_hidmap_entry_t *e = &map->entries[report_id];
                     if (!e->seen) {

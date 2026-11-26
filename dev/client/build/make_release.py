@@ -35,19 +35,28 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def copy_docs(outdir: Path, prev: Path, version: str) -> None:
+def copy_docs(outdir: Path, version: str) -> None:
     for name in ("LICENSE", "THIRD_PARTY.md"):
-        src = prev / name
-        if src.exists():
-            shutil.copy2(src, outdir / name)
-            log(f"  复制 {name}")
+        src = REPO / name
+        if not src.is_file():
+            raise SystemExit(f"缺少发布文档：{src}")
+        shutil.copy2(src, outdir / name)
+        log(f"  复制 {name}")
 
-    readme = prev / "README.md"
-    if readme.exists():
-        text = readme.read_text(encoding="utf-8")
-        text = text.replace("1.0.0", version)
-        (outdir / "README.md").write_text(text, encoding="utf-8", newline="\n")
-        log(f"  生成 README.md（版本号 1.0.0 → {version}）")
+    readme = REPO / "README.md"
+    if not readme.is_file():
+        raise SystemExit(f"缺少发布文档：{readme}")
+    text = readme.read_text(encoding="utf-8")
+    (outdir / "README.md").write_text(text, encoding="utf-8", newline="\n")
+    log(f"  生成 README.md（来自仓库当前版本 {version}）")
+
+    manual = REPO / "docs" / "使用手册.md"
+    if not manual.is_file():
+        raise SystemExit(f"缺少发布手册：{manual}")
+    manual_text = manual.read_text(encoding="utf-8")
+    (outdir / f"MANUAL-{version}-zh.md").write_text(
+        manual_text, encoding="utf-8", newline="\n")
+    log(f"  生成 MANUAL-{version}-zh.md")
 
 
 def copy_firmware(outdir: Path, version: str) -> None:
@@ -58,7 +67,8 @@ def copy_firmware(outdir: Path, version: str) -> None:
         raise SystemExit(f"找不到固件：{src}（先跑 build_fw.py）")
     dst = fw_dir / f"remote_bridge-{version}.bin"
     shutil.copy2(src, dst)
-    log(f"  固件 → firmware/{dst.name}（{dst.stat().st_size} 字节）")
+    shutil.copy2(src, outdir / dst.name)
+    log(f"  固件 → {dst.name} + firmware/{dst.name}（{dst.stat().st_size} 字节）")
 
 
 def copy_phone_apk(outdir: Path, version: str) -> None:
@@ -70,18 +80,16 @@ def copy_phone_apk(outdir: Path, version: str) -> None:
     """
     src_dir = Path(os.environ.get("MOTO_APK_DIR", ""))
     if not src_dir:
-        print("  （跳过 APK：设置 MOTO_APK_DIR 后再跑）")
-        return
-    wanted = ("Fremote-%s.apk" % version, "Movo-%s.apk" % version, "movo.keystore")
-    for name in wanted:
-        src = src_dir / name
-        if not src.exists():
-            continue
-        dst = outdir / name
-        if name.startswith("Movo-"):
-            dst = outdir / ("Fremote-" + name.split("-", 1)[1])
-        shutil.copy2(src, dst)
-        print("  复制 %s" % dst.name)
+        raise SystemExit("缺少 MOTO_APK_DIR：正式发布必须提供当前版本 APK 来源")
+    apk_src = src_dir / f"Fremote-{version}.apk"
+    if not apk_src.is_file():
+        raise SystemExit(f"找不到当前版本 APK：{apk_src}")
+    shutil.copy2(apk_src, outdir / apk_src.name)
+    print("  复制 %s" % apk_src.name)
+    keystore = src_dir / "movo.keystore"
+    if keystore.is_file():
+        shutil.copy2(keystore, outdir / keystore.name)
+        print("  复制 %s" % keystore.name)
 
 
 def zip_win64(outdir: Path, version: str) -> Path:
@@ -132,16 +140,25 @@ def zip_src(outdir: Path, version: str, prev: Path) -> Path:
                 if path.is_dir():
                     continue
                 # 别把打包中间产物、缓存塞进源码包
-                parts = set(path.parts)
-                if parts & {"__pycache__", "build", ".venv", ".pytest_cache",
-                            "dist", "node_modules", "models"}:
+                rel = path.relative_to(REPO)
+                excluded = {"__pycache__", "build", ".venv", ".pytest_cache",
+                            "dist", "dist_scratch", "work_scratch", "build_work",
+                            "node_modules", "models", "temp", "logs"}
+                if rel.parts[:3] == ("dev", "client", "build"):
+                    excluded.discard("build")
+                if any(p in excluded or p.startswith("build_")
+                       for p in rel.parts):
                     continue
                 # ★ 二进制与大文件不进源码包 ★
                 #   ASR 模型、固件、依赖 DLL 都是几十上百 MB 的东西，
                 #   塞进源码包会让它变成几百 MB —— 源码包只放源码。
+                if rel.name.startswith(("_patch", "notes")) or \
+                        rel.suffix.lower() == ".spec":
+                    continue
                 if path.suffix.lower() in (".pyc", ".bin", ".elf", ".onnx",
                                           ".wav", ".exe", ".pyd", ".dll",
-                                          ".zip", ".pth", ".so"):
+                                          ".zip", ".pth", ".so", ".log",
+                                          ".key", ".pem", ".p12", ".pfx"):
                     continue
                 try:
                     if path.stat().st_size > 2 * 1024 * 1024:
@@ -194,8 +211,13 @@ def make_sums(outdir: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", required=True)
+    ap.add_argument("--no-apk", action="store_true",
+                    help="本次只发 PC 客户端，不打包手机 APK")
+    ap.add_argument("--fw-version", default="",
+                    help="固件版本号；默认跟发布版本一致（客户端单独修 Bug 时可指定旧值）")
     args = ap.parse_args()
     version = args.version
+    fw_version = args.fw_version or version
 
     outdir = RELEASES / version
     if not outdir.exists():
@@ -203,9 +225,12 @@ def main() -> int:
     prev = RELEASES / "1.0.0"
 
     log(f"=== 补齐 releases/{version} ===")
-    copy_docs(outdir, prev, version)
-    copy_firmware(outdir, version)
-    copy_phone_apk(outdir, version)
+    copy_docs(outdir, version)
+    copy_firmware(outdir, fw_version)
+    if args.no_apk:
+        log("  跳过手机 APK（--no-apk）")
+    else:
+        copy_phone_apk(outdir, version)
     zip_win64(outdir, version)
     zip_src(outdir, version, prev)
     make_sums(outdir)

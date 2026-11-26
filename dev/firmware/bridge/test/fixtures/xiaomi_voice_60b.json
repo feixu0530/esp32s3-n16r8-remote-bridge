@@ -1,0 +1,23 @@
+{
+  "source": "dev/client/temp/vibecoding-xiaomi-voice.pcap",
+  "record_bytes": 60,
+  "frame_count": 909,
+  "sha256": "dd18600b886a9d63a301badc338d6f1ae6b24555ec1a4be9022c1aa2b0b94fd9",
+  "h2": {
+    "8": 227,
+    "56": 228,
+    "200": 227,
+    "248": 227
+  },
+  "handles": {
+    "0x0029": 307,
+    "0x002d": 301,
+    "0x0031": 301
+  },
+  "notify_lengths": {
+    "1": 1,
+    "8": 2,
+    "20": 2,
+    "60": 909
+  }
+}

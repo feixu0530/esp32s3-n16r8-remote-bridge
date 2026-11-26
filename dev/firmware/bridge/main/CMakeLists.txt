@@ -19,6 +19,10 @@ idf_component_register(SRCS
     "br_usb.h"
     "br_voice.c"
     "br_voice.h"
+    "br_voice_input.c"
+    "br_voice_input.h"
+    "br_msbc.c"
+    "br_msbc.h"
     "br_led.c"
     "br_led.h"
     "br_uart.c"
@@ -42,7 +46,7 @@ idf_component_register(SRCS
     REQUIRES bt nvs_flash esp_timer esp_driver_rmt esp_driver_uart
              driver esp_common esp_ringbuf esp_tinyusb tinyusb
              esp_wifi esp_netif esp_event esp_http_server esp_https_server esp-tls
-             lwip esp_coex)
+             lwip esp_coex xiaomi_msbc)
 
 # The ESP-IDF TinyUSB wrapper exposes CDC/HID Kconfig switches but this
 # project's custom composite descriptor also includes a UAC1 microphone.

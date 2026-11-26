@@ -313,9 +313,45 @@ static const br_default_bind_t k_binds_phone[] = {
     { BR_KEY_MAKE(BR_SRC_PHONE, BR_PHU_PLAY_PAUSE),  0, 2, 0x00, 1, { 0xCD } },  /* 播放 → 消费者播放/暂停 */
 };
 
+/*
+ * 小米蓝牙语音遥控器一代（广播名 "MI RC" / "小米蓝牙语音遥控器"）
+ *
+ * ★ 实测（2026-11-24，证据见 dev/docs/xiaomi-gen1-capture.md）★
+ *   它的按键走**键盘页**（Usage Page 0x07），8 字节标准键盘报告：
+ *     byte0=修饰键, byte1=保留, byte2..7=键码
+ *   所以 key_id = (BR_SRC_KEYBOARD << 12) | usage ——
+ *   与谷歌遥控器的消费者页（src=2）空间天然隔离，互不覆盖。
+ *
+ *   语音键（usage 0x3E）不进映射表：它是语音通道的触发，不是普通按键。
+ */
+static const br_default_bind_t k_binds_xiaomi[] = {
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x52), 0, 1, 0x00, 1, { 0x52 } },  /* 上   → ↑ */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x51), 0, 1, 0x00, 1, { 0x51 } },  /* 下   → ↓ */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x50), 0, 1, 0x00, 1, { 0x50 } },  /* 左   → ← */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x4F), 0, 1, 0x00, 1, { 0x4F } },  /* 右   → → */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x28), 0, 1, 0x00, 1, { 0x28 } },  /* 确定 → Enter */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x4A), 0, 1, 0x08, 1, { 0x07 } },  /* 主页 → Win+D 显示桌面 */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0xF1), 0, 1, 0x00, 1, { 0x2A } },  /* 返回 → Backspace */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0xF1), 2, 1, 0x00, 1, { 0x2A } },  /* 返回 长按 → Backspace */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x65), 0, 1, 0x02, 1, { 0x43 } },  /* 菜单 → Shift+F10 右键菜单 */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x80), 0, 2, 0x00, 1, { 0xE9 } },  /* 音量+ → 消费者音量+ */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x81), 0, 2, 0x00, 1, { 0xEA } },  /* 音量- → 消费者音量- */
+    { BR_KEY_MAKE(BR_SRC_KEYBOARD, 0x66), 0, 1, 0x00, 1, { 0x29 } },  /* 电源 → Esc */
+};
+
+/*
+ * 型号档案表。
+ *
+ * name_match 里可以用 '|' 分隔多个匹配串（大小写不敏感）：
+ *   同一个型号在不同固件/不同场景下的广播名不一样
+ *   （小米这台实测见过 "MI RC"，Windows 侧还见过 "小米蓝牙语音遥控器"）。
+ */
 static const br_default_profile_t k_default_profiles[] = {
     { "chromecast", "chromecast", "谷歌遥控器", k_binds_chromecast,
       (int)(sizeof(k_binds_chromecast) / sizeof(k_binds_chromecast[0])) },
+    { "xiaomi", "mi rc|小米蓝牙语音遥控器|xiaomi remote|xiaomi bluetooth remote",
+      "小米遥控器", k_binds_xiaomi,
+      (int)(sizeof(k_binds_xiaomi) / sizeof(k_binds_xiaomi[0])) },
 };
 
 /** 名字里是否含有 needle（忽略大小写） */
@@ -339,6 +375,38 @@ static bool name_contains(const char *hay, const char *needle)
 }
 
 /** 按广播名找默认档案。找不到返回 NULL（不认识就不乱配）。 */
+/**
+ * 档案的 name_match 里可以有多个匹配串（'|' 分隔），命中任意一个就算。
+ *
+ * 同一个型号在不同固件下广播名不一样
+ * （小米这台实测广播名是 "MI RC"；Windows 侧还见过 "小米蓝牙语音遥控器"）。
+ */
+static bool profile_name_matches(const br_default_profile_t *p, const char *name)
+{
+    if (!p || !p->name_match || !name || !name[0]) {
+        return false;
+    }
+    /* name_match 是一串 '|' 分隔的匹配串，命中任意一个就算 */
+    const char *cur = p->name_match;
+    while (cur && *cur) {
+        const char *sep = strchr(cur, '|');
+        size_t len = sep ? (size_t)(sep - cur) : strlen(cur);
+        if (len > 0) {
+            char one[64];
+            if (len >= sizeof(one)) {
+                len = sizeof(one) - 1;
+            }
+            memcpy(one, cur, len);
+            one[len] = '\0';
+            if (name_contains(name, one)) {
+                return true;
+            }
+        }
+        cur = sep ? sep + 1 : NULL;
+    }
+    return false;
+}
+
 static const br_default_profile_t *profile_for_name(const char *name)
 {
     if (!name || !name[0]) {
@@ -346,7 +414,7 @@ static const br_default_profile_t *profile_for_name(const char *name)
     }
     int n = (int)(sizeof(k_default_profiles) / sizeof(k_default_profiles[0]));
     for (int i = 0; i < n; i++) {
-        if (name_contains(name, k_default_profiles[i].name_match)) {
+        if (profile_name_matches(&k_default_profiles[i], name)) {
             return &k_default_profiles[i];
         }
     }

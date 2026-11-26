@@ -159,12 +159,17 @@ def test_unpair_uses_pl_idx(ctl: BridgeController) -> None:
         sent.append((verb, args))
 
     ctl._ask = fake_ask
-    ctl._cfg["remotes"] = [
-        {"addr": "A", "pl_idx": 3, "name": "x"},
-        {"addr": "B", "pl_idx": 7, "name": "y"},
-    ]
-    ctl._rebuild_remote_model()
-    ctl.removeRemote(1)
+    old_proto = ctl._proto
+    ctl._proto = object()
+    try:
+        ctl._cfg["remotes"] = [
+            {"addr": "A", "pl_idx": 3, "name": "x"},
+            {"addr": "B", "pl_idx": 7, "name": "y"},
+        ]
+        ctl._rebuild_remote_model()
+        ctl.removeRemote(1)
+    finally:
+        ctl._proto = old_proto
     check("UNPAIR 用的是板子槽位号",
           ("UNPAIR", (7,)) in sent, str(sent))
     check("UNPAIR 没拿界面行号当槽位号",
@@ -257,13 +262,13 @@ def test_firmware_peer_slot_release() -> None:
     check("固件有 VOICE 命令",
           'strcmp(verb, "VOICE")' in main_src, "")
     check("固件版本号是 1.2.3",
-          '#define FW_VERSION "2.0.0"' in main_src, "")
+          '#define FW_VERSION "3.0.0"' in main_src, "")
 
 
 def test_client_version() -> None:
     """客户端版本号。"""
     from core import version
-    check("客户端版本 1.2.3", version.VERSION == "2.0.0", version.VERSION)
+    check("客户端版本 1.2.3", version.VERSION == "3.0.0", version.VERSION)
 
 
 def main() -> int:

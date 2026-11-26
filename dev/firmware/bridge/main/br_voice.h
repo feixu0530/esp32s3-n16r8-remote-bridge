@@ -13,11 +13,16 @@ esp_err_t br_voice_init(void);
  * 返回 false = 没按（比如语音通道被关了）—— 事件要靠它说实话，
  * 不然日志会说「触发了」而输入法根本没收到。
  */
-bool br_voice_control(const uint8_t *data, size_t len);
-void br_voice_audio(const uint8_t *data, size_t len);
+bool br_voice_control(const uint8_t *data, size_t len, int8_t peer_idx);
+void br_voice_audio(const uint8_t *data, size_t len, int8_t peer_idx);
 size_t br_voice_read_pcm(void *dst, size_t max_bytes);
 bool br_voice_streaming(void);
 bool br_voice_set_hotkey(uint8_t modifier, const uint8_t *keys, uint8_t count);
+
+/** 小米物理语音键：按下复用 USB 热键，释放只影响该 peer 的所有权。 */
+bool br_voice_xiaomi_press(int8_t peer_idx);
+void br_voice_xiaomi_release(int8_t peer_idx);
+void br_voice_xiaomi_audio(const uint8_t *data, size_t len, int8_t peer_idx);
 
 /**
  * 读回当前语音快捷键（PC 端语音页要显示板子上真正生效的值）。
@@ -66,6 +71,6 @@ void br_voice_push_phone_adpcm(const uint8_t *data, size_t len, bool reset);
  * 主循环周期调用。
  */
 void br_voice_watchdog(void);
-/** 链路断开：把可能还按着的语音热键放掉 */
-void br_voice_on_disconnect(void);
+/** 链路断开：只释放该 peer 持有的 ATVV/小米热键，不影响其他遥控器。 */
+void br_voice_on_disconnect(int8_t peer_idx);
 

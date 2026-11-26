@@ -7,7 +7,7 @@
  *
  * 结构：
  *   左边是键名（MappingKeyLabel），右边是三格 —— 单击 / 双击 / 长按。
- *   语音键（mic）特殊：双击 / 长按合并成「语音模式下暂停」（跨两列）。
+ *   语音键（mic）特殊：只显示语音页录制的热键和修改提示，不参与按键映射。
  *
  * 整张卡是一个按钮：点一下打开动作编辑器。
  */
@@ -163,34 +163,34 @@ AbstractButton {
         }
     }
 
-    /* 语音键：双击 / 长按跨两列合成一个格子（参考 143-189） */
-    component VoicePausedCell: Item {
+    /* 语音键：只显示语音页录制的热键，并指向语音页修改 */
+    component VoiceRecordedCell: Item {
+        id: voiceCell
+        readonly property bool hasKey:
+            !!root.singleText && root.singleText.trim().length > 0
+            && root.singleText.trim() !== qsTr("未设置")
+            && root.singleText.trim() !== qsTr("（未设置）")
+
         Layout.fillWidth: true
         Layout.fillHeight: true
-        Layout.columnSpan: 2
-        implicitHeight: 30
-
-        Rectangle {
-            anchors.left: parent.left
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            width: root.tokens.hairlineWidth
-            color: root.tokens.border
-        }
+        implicitHeight: 34
 
         ColumnLayout {
             anchors.fill: parent
-            anchors.leftMargin: 3
-            anchors.rightMargin: 3
             spacing: 0
 
             UiLabel {
+                objectName: root.exposeObjectNames
+                    ? "mappingVoiceKeyText_" + root.cardId : ""
                 tokens: root.tokens
-                kind: noteKind
+                kind: bodyKind
                 Layout.fillWidth: true
-                Layout.preferredHeight: 13
-                text: qsTr("双击 / 长按")
-                color: root.tokens.disabledText
+                Layout.preferredHeight: 22
+                text: voiceCell.hasKey
+                    ? root.displayBinding(root.singleText.trim()) : qsTr("未设置")
+                color: voiceCell.hasKey
+                    ? root.tokens.textPrimary : root.tokens.disabledText
+                font.family: root.tokens.fontFamilyMono
                 font.pixelSize: root.tokens.fontSizeMapGesture
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
@@ -198,13 +198,14 @@ AbstractButton {
             }
             UiLabel {
                 objectName: root.exposeObjectNames
-                    ? "mappingVoicePausedText_" + root.cardId : ""
+                    ? "mappingVoiceHint_" + root.cardId : ""
                 tokens: root.tokens
                 kind: noteKind
                 Layout.fillWidth: true
-                Layout.preferredHeight: 22
-                text: qsTr("语音模式下暂停")
+                Layout.preferredHeight: 12
+                text: qsTr("修改语音键映射到语音页录制")
                 color: root.tokens.disabledText
+                font.pixelSize: root.tokens.fontSizeSmall - 1
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
                 elide: Text.ElideRight
@@ -252,13 +253,14 @@ AbstractButton {
         GridLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            columns: 3
+            columns: root.voiceAction ? 1 : 3
             columnSpacing: 0
             rowSpacing: 0
 
             GestureCell {
                 objectName: root.exposeObjectNames
                     ? "mappingSingleCell_" + root.cardId : ""
+                visible: !root.voiceAction
                 gestureLabel: qsTr("单击")
                 bindingText: root.singleText
                 noteText: root.singleNoteText
@@ -288,9 +290,9 @@ AbstractButton {
                     ? "mappingLongPrimaryText_" + root.cardId : ""
             }
 
-            VoicePausedCell {
+            VoiceRecordedCell {
                 objectName: root.exposeObjectNames
-                    ? "mappingVoicePausedCell_" + root.cardId : ""
+                    ? "mappingVoiceRecordedCell_" + root.cardId : ""
                 visible: root.voiceAction
             }
         }

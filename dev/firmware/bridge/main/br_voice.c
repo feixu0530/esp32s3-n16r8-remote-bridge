@@ -10,6 +10,9 @@
 #include "nvs.h"
 #include "br_usb.h"
 #include "br_led.h"
+#include "br_voice_input.h"
+#include "br_msbc.h"
+#include "br_types.h"
 
 static const char *TAG = "br_voice";
 #define ATVV_DEFAULT_FRAME_SIZE 120
@@ -57,12 +60,20 @@ static size_t s_preroll_len;
  *   数据竞争 + memcpy 重叠 → 内存踩坏，板子直接死机（现象：突然 ping 不通）。
  */
 static SemaphoreHandle_t s_preroll_lock;
-static uint16_t s_frame_size = ATVV_DEFAULT_FRAME_SIZE;
+static uint16_t s_atvv_frame_size[BR_MAX_PEERS];
 static uint8_t s_pending[ATVV_MAX_FRAME_SIZE];
 static uint16_t s_pending_len;
 static int32_t s_predictor;
 static int s_step_index;
 static bool s_streaming;
+static int8_t s_atvv_peer = -1;
+static bool s_xiaomi_stream;
+static int8_t s_xiaomi_peer = -1;
+static uint32_t s_xau_rx;
+static uint32_t s_xau_ok;
+static uint32_t s_xau_err;
+static uint32_t s_xau_rejected;
+static uint32_t s_xau_log_ms;
 static bool s_decoder_synced;
 static float s_hp_x, s_hp_y;
 static bool s_hp_initialized;
@@ -80,6 +91,20 @@ static bool s_hotkey_down;
 static uint32_t s_pressed_at = 0;   /* 热键按下的时刻（ms），看门狗用 */
 static volatile uint32_t s_last_audio_ms = 0;  /* 最近一帧语音的时间（ms） */
 static portMUX_TYPE s_hotkey_mux = portMUX_INITIALIZER_UNLOCKED;
+
+typedef enum {
+    VOICE_OWNER_NONE = 0,
+    VOICE_OWNER_ATVV,
+    VOICE_OWNER_PHONE,
+    VOICE_OWNER_XIAOMI,
+} voice_owner_t;
+
+/* first-wins：只有 owner/peer 都匹配的释放才能放掉当前热键。 */
+static voice_owner_t s_hotkey_owner = VOICE_OWNER_NONE;
+static int8_t s_owner_peer = -1;
+static bool s_physical_hold;
+static bool s_hotkey_releasing;
+static SemaphoreHandle_t s_voice_session_lock;
 
 static bool save_hotkey(const voice_hotkey_t *hotkey)
 {
@@ -135,6 +160,67 @@ static void voice_hotkey_release(void)
     bridge_led_voice_off();
 }
 
+static bool voice_hotkey_acquire_locked(voice_owner_t owner, int8_t peer_idx)
+{
+    portENTER_CRITICAL(&s_hotkey_mux);
+    if (s_hotkey_owner != VOICE_OWNER_NONE || s_hotkey_releasing) {
+        portEXIT_CRITICAL(&s_hotkey_mux);
+        return false;
+    }
+    s_hotkey_owner = owner;
+    s_owner_peer = peer_idx;
+    if (owner == VOICE_OWNER_XIAOMI) {
+        s_physical_hold = true;
+    }
+    portEXIT_CRITICAL(&s_hotkey_mux);
+
+    if (!voice_hotkey_press()) {
+        portENTER_CRITICAL(&s_hotkey_mux);
+        s_hotkey_owner = VOICE_OWNER_NONE;
+        s_owner_peer = -1;
+        s_physical_hold = false;
+        portEXIT_CRITICAL(&s_hotkey_mux);
+        return false;
+    }
+    return true;
+}
+
+static bool voice_hotkey_release_owner_locked(voice_owner_t owner, int8_t peer_idx)
+{
+    portENTER_CRITICAL(&s_hotkey_mux);
+    if (s_hotkey_owner != owner || s_owner_peer != peer_idx) {
+        portEXIT_CRITICAL(&s_hotkey_mux);
+        return false;
+    }
+    s_hotkey_owner = VOICE_OWNER_NONE;
+    s_owner_peer = -1;
+    s_hotkey_releasing = true;
+    if (owner == VOICE_OWNER_XIAOMI) {
+        s_physical_hold = false;
+    }
+    portEXIT_CRITICAL(&s_hotkey_mux);
+    voice_hotkey_release();
+    portENTER_CRITICAL(&s_hotkey_mux);
+    s_hotkey_releasing = false;
+    portEXIT_CRITICAL(&s_hotkey_mux);
+    return true;
+}
+
+/* 只用于禁用、异常看门狗等必须全局解除卡键的安全路径。 */
+static void voice_hotkey_release_force_locked(void)
+{
+    portENTER_CRITICAL(&s_hotkey_mux);
+    s_hotkey_owner = VOICE_OWNER_NONE;
+    s_owner_peer = -1;
+    s_physical_hold = false;
+    s_hotkey_releasing = true;
+    portEXIT_CRITICAL(&s_hotkey_mux);
+    voice_hotkey_release();
+    portENTER_CRITICAL(&s_hotkey_mux);
+    s_hotkey_releasing = false;
+    portEXIT_CRITICAL(&s_hotkey_mux);
+}
+
 /*
  * ★ 语音热键看门狗（只处理「异常」，不限制正常说话时长）★
  *
@@ -153,58 +239,100 @@ static void voice_hotkey_release(void)
 #define BR_VOICE_PHONE_IDLE_MS      10000u
 #define BR_VOICE_NO_STREAM_GRACE_MS  1500u
 #define BR_VOICE_ABSOLUTE_MAX_MS     600000u   /* 10 分钟硬上限 */
+#define BR_VOICE_PHYSICAL_MAX_MS     60000u    /* 小米物理键最多按住 60 秒 */
+#define BR_VOICE_XIAOMI_IDLE_MS       1500u
+
+static void xiaomi_stream_end_locked(const char *why);
 
 void br_voice_watchdog(void)
 {
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
     bool down;
+    bool physical;
+    voice_owner_t owner;
+    int8_t owner_peer;
     uint32_t at;
     portENTER_CRITICAL(&s_hotkey_mux);
     down = s_hotkey_down;
+    physical = s_physical_hold;
+    owner = s_hotkey_owner;
+    owner_peer = s_owner_peer;
     at = s_pressed_at;
     portEXIT_CRITICAL(&s_hotkey_mux);
     if (!down) {
+        int8_t peer = br_voice_input_peer();
+        if (peer >= 0 && voice_hotkey_acquire_locked(VOICE_OWNER_XIAOMI, peer)) {
+            ESP_LOGI(TAG, "小米语音仍按住，重新获得热键 peer=%d", peer);
+        }
+        xSemaphoreGive(s_voice_session_lock);
         return;
     }
-    bridge_led_voice_active();   /* 按住期间续期，灯不会因 800ms 空闲超时熄灭 */
+    bridge_led_voice_active();
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+
+    if (physical && owner == VOICE_OWNER_XIAOMI) {
+        if (s_xiaomi_stream &&
+            (now - s_last_audio_ms) > BR_VOICE_XIAOMI_IDLE_MS) {
+            ESP_LOGW(TAG, "小米音频 %u ms 无新帧，停止收音但保留热键",
+                     (unsigned)BR_VOICE_XIAOMI_IDLE_MS);
+            xiaomi_stream_end_locked("无新帧");
+        }
+        if (!br_voice_input_active()) {
+            ESP_LOGW(TAG, "小米物理输入已不活跃，释放热键 peer=%d", owner_peer);
+            xiaomi_stream_end_locked("输入不活跃");
+            voice_hotkey_release_owner_locked(VOICE_OWNER_XIAOMI, owner_peer);
+        } else if ((now - at) > BR_VOICE_PHYSICAL_MAX_MS) {
+            ESP_LOGW(TAG, "小米物理语音键按住超过 60 秒，兜底释放");
+            xiaomi_stream_end_locked("60秒上限");
+            br_voice_input_reset();
+            voice_hotkey_release_owner_locked(VOICE_OWNER_XIAOMI, owner_peer);
+        }
+        xSemaphoreGive(s_voice_session_lock);
+        return;
+    }
 
     if ((now - at) > BR_VOICE_ABSOLUTE_MAX_MS) {
         ESP_LOGW(TAG, "语音热键按住超过 10 分钟，兜底释放");
-        voice_hotkey_release();
-        s_streaming = false;
-        s_phone_active = false;
-        s_last_audio_ms = 0;
+        if (voice_hotkey_release_owner_locked(owner, owner_peer)) {
+            s_streaming = false;
+            s_phone_active = false;
+            if (owner == VOICE_OWNER_ATVV) {
+                s_atvv_peer = -1;
+            }
+            s_last_audio_ms = 0;
+        }
+        xSemaphoreGive(s_voice_session_lock);
         return;
     }
 
     if (s_streaming) {
         uint32_t last = s_last_audio_ms ? s_last_audio_ms : at;
-        /*
-         * ★ 手机路径的空闲判定要宽松得多 ★
-         *   遥控器（ATVV/BLE）的音频是连续不断流，3 秒没音频就是它停了。
-         *   手机走的是 WiFi + HTTP：每个 PCM 包都要等 TCP 把最后一段送到
-         *   （实测单包 250ms~5s），WiFi 一抖动就可能空档好几秒 ——
-         *   用同一个 3 秒判定会把会话直接掐掉，语音永远起不来。
-         *   手机路径给 10 秒，遥控器路径保持 3 秒。
-         */
         uint32_t idle_limit = s_phone_active ? BR_VOICE_PHONE_IDLE_MS
                                               : BR_VOICE_STREAM_IDLE_MS;
         if ((now - last) > idle_limit) {
             ESP_LOGW(TAG, "语音流 %u ms 没有音频，视为结束并释放热键",
                      (unsigned)idle_limit);
-            voice_hotkey_release();
-            s_streaming = false;
-            /* 手机语音也要一起停 —— 否则会一直占着 UAC 端点不供给 ATVV */
-            s_phone_active = false;
-            s_last_audio_ms = 0;
+            if (voice_hotkey_release_owner_locked(owner, owner_peer)) {
+                s_streaming = false;
+                s_phone_active = false;
+                if (owner == VOICE_OWNER_ATVV) {
+                    s_atvv_peer = -1;
+                }
+                s_last_audio_ms = 0;
+            }
         }
-        return;      /* 还在收音 → 绝不释放 */
+        xSemaphoreGive(s_voice_session_lock);
+        return;
     }
 
     if ((now - at) > BR_VOICE_NO_STREAM_GRACE_MS) {
         ESP_LOGW(TAG, "热键按着但没有语音流，释放");
-        voice_hotkey_release();
+        if (voice_hotkey_release_owner_locked(owner, owner_peer) &&
+            owner == VOICE_OWNER_ATVV) {
+            s_atvv_peer = -1;
+        }
     }
+    xSemaphoreGive(s_voice_session_lock);
 }
 
 static int16_t decode_nibble(uint8_t nibble)
@@ -244,6 +372,31 @@ static void clear_pcm(void)
     }
 }
 
+static void clear_phone_pcm(void)
+{
+    if (!s_phone_rb) return;
+    size_t n = 0;
+    void *item;
+    while ((item = xRingbufferReceiveUpTo(s_phone_rb, &n, 0, PCM_RING_BYTES)) != NULL) {
+        vRingbufferReturnItem(s_phone_rb, item);
+    }
+}
+
+static void xiaomi_stream_end_locked(const char *why)
+{
+    if (!s_xiaomi_stream) {
+        return;
+    }
+    s_xiaomi_stream = false;
+    s_xiaomi_peer = -1;
+    s_streaming = false;
+    s_last_audio_ms = 0;
+    clear_pcm();
+    ESP_LOGI(TAG, "小米音频结束 %s rx=%u ok=%u err=%u rejected=%u",
+             why ? why : "", (unsigned)s_xau_rx, (unsigned)s_xau_ok,
+             (unsigned)s_xau_err, (unsigned)s_xau_rejected);
+}
+
 static void decode_frame(const uint8_t *frame, size_t len)
 {
     int16_t pcm[ATVV_MAX_FRAME_SIZE * 2];
@@ -276,6 +429,10 @@ static void decode_frame(const uint8_t *frame, size_t len)
 
 esp_err_t br_voice_init(void)
 {
+    if (!s_voice_session_lock) {
+        s_voice_session_lock = xSemaphoreCreateMutex();
+        if (!s_voice_session_lock) return ESP_ERR_NO_MEM;
+    }
     if (!s_pcm_rb) s_pcm_rb = xRingbufferCreate(PCM_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
     if (!s_pcm_rb) return ESP_ERR_NO_MEM;
     /* 预卷缓冲的锁（HTTP 会话任务是并发的） */
@@ -285,6 +442,10 @@ esp_err_t br_voice_init(void)
     }
     reset_decoder();
     s_streaming = false;
+    s_atvv_peer = -1;
+    for (int i = 0; i < BR_MAX_PEERS; i++) {
+        s_atvv_frame_size[i] = ATVV_DEFAULT_FRAME_SIZE;
+    }
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("br_voice", NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
@@ -341,29 +502,63 @@ bool br_voice_get_hotkey(uint8_t *modifier, uint8_t *keys, uint8_t *count)
     return true;
 }
 
-void br_voice_on_disconnect(void)
+void br_voice_on_disconnect(int8_t peer_idx)
 {
-    if (s_hotkey_down) {
-        ESP_LOGW(TAG, "链路断开，释放语音热键");
-        voice_hotkey_release();
+    if (peer_idx < 0) {
+        return;
     }
-    s_streaming = false;
-    s_last_audio_ms = 0;
-    s_pending_len = 0;
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    br_voice_input_result_t input_result =
+        br_voice_input_peer_reset(peer_idx, now);
+    if (input_result == BR_VOICE_INPUT_RELEASED) {
+        ESP_LOGI(TAG, "小米语音输入随断链结束 peer=%d", peer_idx);
+    }
+
+    if (s_xiaomi_peer == peer_idx) {
+        xiaomi_stream_end_locked("断链");
+    }
+    voice_hotkey_release_owner_locked(VOICE_OWNER_XIAOMI, peer_idx);
+    if (voice_hotkey_release_owner_locked(VOICE_OWNER_ATVV, peer_idx)) {
+        s_streaming = false;
+        s_atvv_peer = -1;
+        s_last_audio_ms = 0;
+        s_pending_len = 0;
+        clear_pcm();
+    }
+    xSemaphoreGive(s_voice_session_lock);
 }
 
 void br_voice_set_enabled(bool on)
 {
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
     s_enabled = on;
-    /* ★ 存进 NVS：板子重启后还是这个状态 ★ */
+    if (!on) {
+        xiaomi_stream_end_locked("语音通道关闭");
+        voice_hotkey_release_force_locked();
+        br_voice_input_reset();
+        s_streaming = false;
+        s_phone_active = false;
+        s_atvv_peer = -1;
+        s_last_audio_ms = 0;
+        s_pending_len = 0;
+        clear_pcm();
+        clear_phone_pcm();
+        if (s_preroll_lock) {
+            xSemaphoreTake(s_preroll_lock, portMAX_DELAY);
+        }
+        s_preroll_len = 0;
+        if (s_preroll_lock) {
+            xSemaphoreGive(s_preroll_lock);
+        }
+    }
+    xSemaphoreGive(s_voice_session_lock);
+
     nvs_handle_t nvs;
     if (nvs_open("br_voice", NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_set_u8(nvs, "enabled", on ? 1 : 0);
         nvs_commit(nvs);
         nvs_close(nvs);
-    }
-    if (!on) {
-        voice_hotkey_release();
     }
 }
 
@@ -372,40 +567,142 @@ bool br_voice_enabled(void)
     return s_enabled;
 }
 
-bool br_voice_control(const uint8_t *data, size_t len)
+bool br_voice_xiaomi_press(int8_t peer_idx)
+{
+    if (peer_idx < 0) {
+        return false;
+    }
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
+    bool acquired = voice_hotkey_acquire_locked(VOICE_OWNER_XIAOMI, peer_idx);
+    if (acquired) {
+        s_xau_rx = 0;
+        s_xau_ok = 0;
+        s_xau_err = 0;
+        s_xau_rejected = 0;
+        s_xau_log_ms = 0;
+        ESP_LOGI(TAG, "小米物理语音键获得热键 peer=%d", peer_idx);
+    }
+    xSemaphoreGive(s_voice_session_lock);
+    return acquired;
+}
+
+void br_voice_xiaomi_release(int8_t peer_idx)
+{
+    if (peer_idx < 0) {
+        return;
+    }
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
+    if (s_xiaomi_peer == peer_idx) {
+        xiaomi_stream_end_locked("物理键释放");
+    }
+    if (voice_hotkey_release_owner_locked(VOICE_OWNER_XIAOMI, peer_idx)) {
+        ESP_LOGI(TAG, "小米物理语音键释放 peer=%d rx=%u ok=%u err=%u rejected=%u",
+                 peer_idx, (unsigned)s_xau_rx, (unsigned)s_xau_ok,
+                 (unsigned)s_xau_err, (unsigned)s_xau_rejected);
+    }
+    xSemaphoreGive(s_voice_session_lock);
+}
+
+void br_voice_xiaomi_audio(const uint8_t *data, size_t len, int8_t peer_idx)
+{
+    if (!data || peer_idx < 0 || peer_idx >= BR_MAX_PEERS) {
+        return;
+    }
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
+    s_xau_rx++;
+    if (!s_enabled || s_hotkey_owner != VOICE_OWNER_XIAOMI ||
+        s_owner_peer != peer_idx) {
+        s_xau_rejected++;
+        xSemaphoreGive(s_voice_session_lock);
+        return;
+    }
+
+    if (!s_xiaomi_stream) {
+        clear_pcm();
+        if (!br_msbc_reset()) {
+            s_xau_err++;
+            xSemaphoreGive(s_voice_session_lock);
+            return;
+        }
+        s_xiaomi_stream = true;
+        s_xiaomi_peer = peer_idx;
+        s_streaming = true;
+        ESP_LOGI(TAG, "小米音频开始 peer=%d", peer_idx);
+    }
+
+    int16_t pcm[120] = {0};
+    uint32_t h2 = 0;
+    uint32_t rms = 0;
+    if (!br_msbc_decode(data, len, pcm, &h2)) {
+        s_xau_err++;
+    } else {
+        s_xau_ok++;
+        int64_t sum = 0;
+        for (size_t i = 0; i < sizeof(pcm) / sizeof(pcm[0]); i++) {
+            int32_t v = pcm[i];
+            sum += (int64_t)v * v;
+        }
+        rms = (uint32_t)sqrtf((float)sum / (sizeof(pcm) / sizeof(pcm[0])));
+        if (s_pcm_rb) {
+            xRingbufferSend(s_pcm_rb, pcm, sizeof(pcm), 0);
+        }
+    }
+    s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    if ((uint32_t)(esp_timer_get_time() / 1000) - s_xau_log_ms >= 1000) {
+        s_xau_log_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        ESP_LOGI(TAG, "小米音频 rx=%u ok=%u err=%u h2=%02x rms=%u",
+                 (unsigned)s_xau_rx, (unsigned)s_xau_ok,
+                 (unsigned)s_xau_err, (unsigned)h2, (unsigned)rms);
+    }
+    xSemaphoreGive(s_voice_session_lock);
+}
+
+bool br_voice_control(const uint8_t *data, size_t len, int8_t peer_idx)
 {
     bool pressed = false;
-    if (!data || !len) return false;
+    if (!data || !len || peer_idx < 0 || peer_idx >= BR_MAX_PEERS) return false;
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
     switch (data[0]) {
     case 0x0B: /* CAPS: v1.0 version, codec bits, interaction, frame length */
         if (len >= 7) {
             uint16_t frame = (uint16_t)(((uint16_t)data[5] << 8) | data[6]);
             if (frame > 0 && frame <= ATVV_MAX_FRAME_SIZE) {
-                s_frame_size = frame;
-                ESP_LOGI(TAG, "ATVV caps version=%u.%u codec=0x%02x frame=%u",
-                         data[1], data[2], data[3], s_frame_size);
+                s_atvv_frame_size[peer_idx] = frame;
+                ESP_LOGI(TAG, "ATVV caps peer=%d version=%u.%u codec=0x%02x frame=%u",
+                         peer_idx, data[1], data[2], data[3],
+                         s_atvv_frame_size[peer_idx]);
             }
         }
         break;
     case 0x04: /* AUDIO_START */
-        clear_pcm();
-        reset_decoder();
-        pressed = voice_hotkey_press();
-        s_streaming = true;
-        s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        ESP_LOGI(TAG, "AUDIO_START reason=%u codec=%u session=%u frame=%u",
-                 len > 1 ? data[1] : 0, len > 2 ? data[2] : 0,
-                 len > 3 ? data[3] : 0, s_frame_size);
+        pressed = voice_hotkey_acquire_locked(VOICE_OWNER_ATVV, peer_idx);
+        if (pressed) {
+            clear_pcm();
+            reset_decoder();
+            s_atvv_peer = peer_idx;
+            s_streaming = true;
+            s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            ESP_LOGI(TAG, "AUDIO_START peer=%d reason=%u codec=%u session=%u frame=%u",
+                     peer_idx, len > 1 ? data[1] : 0, len > 2 ? data[2] : 0,
+                     len > 3 ? data[3] : 0, s_atvv_frame_size[peer_idx]);
+        } else {
+            ESP_LOGI(TAG, "AUDIO_START 未获得语音热键 peer=%d", peer_idx);
+        }
         break;
     case 0x00: /* AUDIO_STOP */
-        voice_hotkey_release();
-        s_streaming = false;
-        s_last_audio_ms = 0;
-        s_pending_len = 0;
-        ESP_LOGI(TAG, "AUDIO_STOP reason=%u", len > 1 ? data[1] : 0);
+        if (voice_hotkey_release_owner_locked(VOICE_OWNER_ATVV, peer_idx)) {
+            s_streaming = false;
+            s_atvv_peer = -1;
+            s_last_audio_ms = 0;
+            s_pending_len = 0;
+        }
+        ESP_LOGI(TAG, "AUDIO_STOP reason=%u peer=%d",
+                 len > 1 ? data[1] : 0, peer_idx);
         break;
     case 0x0A: /* AUDIO_SYNC predictor and step index */
-        if (len >= 7) {
+        if (len >= 7 && s_hotkey_owner == VOICE_OWNER_ATVV &&
+            s_owner_peer == peer_idx && s_atvv_peer == peer_idx) {
             s_predictor = (int16_t)(((uint16_t)data[4] << 8) | data[5]);
             s_step_index = data[6] > 88 ? 88 : data[6];
             s_hp_initialized = false;
@@ -416,21 +713,31 @@ bool br_voice_control(const uint8_t *data, size_t len)
         break;
     }
     /* ★ 有没有真的把语音热键按出去 ★（事件要靠它说实话） */
+    xSemaphoreGive(s_voice_session_lock);
     return pressed;
 }
 
-void br_voice_audio(const uint8_t *data, size_t len)
+void br_voice_audio(const uint8_t *data, size_t len, int8_t peer_idx)
 {
-    if (!s_streaming || !data || !len || s_frame_size == 0) return;
+    if (!data || !len || peer_idx < 0 || peer_idx >= BR_MAX_PEERS) return;
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
+    if (!s_streaming || s_hotkey_owner != VOICE_OWNER_ATVV ||
+        s_owner_peer != peer_idx || s_atvv_peer != peer_idx ||
+        s_atvv_frame_size[peer_idx] == 0) {
+        xSemaphoreGive(s_voice_session_lock);
+        return;
+    }
+    uint16_t frame_size = s_atvv_frame_size[peer_idx];
     s_last_audio_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (!s_decoder_synced) reset_decoder();
     for (size_t i = 0; i < len; i++) {
         s_pending[s_pending_len++] = data[i];
-        if (s_pending_len == s_frame_size) {
+        if (s_pending_len == frame_size) {
             decode_frame(s_pending, s_pending_len);
             s_pending_len = 0;
         }
     }
+    xSemaphoreGive(s_voice_session_lock);
 }
 
 size_t br_voice_read_pcm(void *dst, size_t max_bytes)
@@ -456,13 +763,16 @@ bool br_voice_streaming(void)
 
 void br_voice_phone_start(void)
 {
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
     if (s_phone_active) {
+        xSemaphoreGive(s_voice_session_lock);
         return;
     }
     if (!s_phone_rb) {
         s_phone_rb = xRingbufferCreate(PCM_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
         if (!s_phone_rb) {
             ESP_LOGE(TAG, "手机语音缓冲分配失败");
+            xSemaphoreGive(s_voice_session_lock);
             return;
         }
     }
@@ -478,12 +788,19 @@ void br_voice_phone_start(void)
     /*
      * ★ 仲裁：手机是主动方，ATVV 让位 ★
      *   手机按住说话时如果遥控器也在收音，两路会交织 → 撕裂。
-     *   这里让 ATVV 停掉。
+     *   这里让 ATVV 停掉；小米 physical-hold 则遵循 first-wins，不抢占。
      */
-    if (s_streaming) {
+    if (s_streaming && s_hotkey_owner == VOICE_OWNER_ATVV) {
+        voice_hotkey_release_owner_locked(VOICE_OWNER_ATVV, s_owner_peer);
         s_streaming = false;
+        s_atvv_peer = -1;
         clear_pcm();
         ESP_LOGI(TAG, "手机语音开始，ATVV 语音让位");
+    }
+    if (!voice_hotkey_acquire_locked(VOICE_OWNER_PHONE, -1)) {
+        ESP_LOGI(TAG, "手机语音未获得热键，其他语音源仍占用");
+        xSemaphoreGive(s_voice_session_lock);
+        return;
     }
 
     s_phone_active = true;
@@ -501,20 +818,23 @@ void br_voice_phone_start(void)
     if (s_preroll_lock) {
         xSemaphoreGive(s_preroll_lock);
     }
-    voice_hotkey_press();
     ESP_LOGI(TAG, "手机语音开始（热键已按下，等待 PC 输入法收音）");
+    xSemaphoreGive(s_voice_session_lock);
 }
 
 void br_voice_phone_end(void)
 {
+    xSemaphoreTake(s_voice_session_lock, portMAX_DELAY);
     if (!s_phone_active) {
+        xSemaphoreGive(s_voice_session_lock);
         return;
     }
     s_phone_active = false;
     s_streaming = false;
     s_last_audio_ms = 0;
-    voice_hotkey_release();
+    voice_hotkey_release_owner_locked(VOICE_OWNER_PHONE, -1);
     ESP_LOGI(TAG, "手机语音结束");
+    xSemaphoreGive(s_voice_session_lock);
 }
 
 void br_voice_push_phone_pcm(const uint8_t *pcm, size_t len)

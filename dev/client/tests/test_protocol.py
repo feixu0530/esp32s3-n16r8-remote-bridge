@@ -148,12 +148,12 @@ def test_events() -> None:
     events: list[tuple[str, dict]] = []
     cli.on_event(lambda name, kv: events.append((name, kv)))
 
-    port.feed("EV CONN idx=0 addr=7E:A2:99:61:45:FE type=0")
+    port.feed("EV CONN idx=0 addr=7E:A2:AA:BB:CC:02 type=0")
     time.sleep(0.2)
     check("收到事件", len(events) == 1, str(events))
     if events:
         check("事件名正确", events[0][0] == "CONN")
-        check("事件 kv 正确", events[0][1].get("addr") == "7E:A2:99:61:45:FE")
+        check("事件 kv 正确", events[0][1].get("addr") == "7E:A2:AA:BB:CC:02")
         check("type 正确", events[0][1].get("type") == "0")
     cli.stop()
 

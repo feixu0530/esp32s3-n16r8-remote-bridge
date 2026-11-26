@@ -40,7 +40,7 @@
 
 static const char *TAG = "app";
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "3.0.0"
 
 /*
  * ★ 链路选择（本轮架构调整的核心）★
@@ -220,6 +220,63 @@ static void handle_command(const char *line)
             return;
         }
         br_proto_send_ok("HIDREPORT", NULL);
+
+    } else if (strcmp(verb, "HIDDATA") == 0) {
+        /*
+         * ★ 订阅「数据通道」报告（语音音频那种大包）★
+         *
+         * 默认不订（CMCC v3 实测订了会顶断链路）。
+         * 小米一代的语音就装在数据通道报告里，取证时用这条命令临时打开。
+         */
+        long idx = 0, on = 0;
+        if (!br_proto_arg_int(&p, 1, &idx) || !br_proto_arg_int(&p, 2, &on)) {
+            br_proto_send_err("HIDDATA", "args", NULL);
+            return;
+        }
+        br_hid_set_xiaomi((int)idx, on != 0);
+        if (on != 0) {
+            /* 重跑一遍订阅流程：这次的表里会带上数据通道 */
+            if (!br_ble_hid_resubscribe((int)idx)) {
+                br_proto_send_err("HIDDATA", "peer", NULL);
+                return;
+            }
+        }
+        br_proto_send_ok("HIDDATA", NULL);
+
+    } else if (strcmp(verb, "HIDREAD") == 0) {
+        /* HIDREAD <peer> <handle>：取证用，读一个特征的值 */
+        long idx = 0, handle = 0;
+        if (!br_proto_arg_int(&p, 1, &idx) || !br_proto_arg_int(&p, 2, &handle)) {
+            br_proto_send_err("HIDREAD", "args", NULL);
+            return;
+        }
+        if (!br_hid_probe_read((int)idx, (uint16_t)handle)) {
+            br_proto_send_err("HIDREAD", "peer", NULL);
+            return;
+        }
+        br_proto_send_ok("HIDREAD", NULL);
+
+    } else if (strcmp(verb, "HIDWRITE") == 0) {
+        /* HIDWRITE <peer> <handle> <hex>：取证用，往特征写数据 */
+        long idx = 0, handle = 0;
+        if (!br_proto_arg_int(&p, 1, &idx) || !br_proto_arg_int(&p, 2, &handle) ||
+            argc < 4) {
+            br_proto_send_err("HIDWRITE", "args", NULL);
+            return;
+        }
+        uint8_t buf[64];
+        uint16_t len = 0;
+        const char *hex = p.argv[3];
+        while (hex[0] && hex[1] && len < (uint16_t)sizeof(buf)) {
+            char pair[3] = { hex[0], hex[1], 0 };
+            buf[len++] = (uint8_t)strtoul(pair, NULL, 16);
+            hex += 2;
+        }
+        if (!br_hid_probe_write((int)idx, (uint16_t)handle, buf, len)) {
+            br_proto_send_err("HIDWRITE", "peer", NULL);
+            return;
+        }
+        br_proto_send_ok("HIDWRITE", NULL);
 
     } else if (strcmp(verb, "MAPBEGIN") == 0) {
         if (argc < 2 || !br_mapping_begin(p.argv[1])) {

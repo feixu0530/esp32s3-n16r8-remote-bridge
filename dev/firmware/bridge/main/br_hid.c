@@ -43,7 +43,8 @@ static const char *TAG = "br_hid";
 #define UUID_REPORT      0x2A4D
 #define UUID_REPORT_MAP  0x2A4B
 #define UUID_BATTERY     0x2A19   /* 电量：拿来当链路保活的读对象 */
-#define UUID_HID_CP      0x2A4C   /* HID Control Point：0x02 = 退出挂起 */
+#define UUID_HID_CP      0x2A4C   /* HID Control Point：0x01 = 退出挂起 */
+#define UUID_PROTOCOL_MODE 0x2A4E /* 0x01 = Report Protocol */
 
 /* 发现步骤（每个步骤 = 发起一个 NimBLE 过程） */
 enum {
@@ -51,6 +52,8 @@ enum {
     STEP_TABLE,        /* 从已发现的特征表里挑出 HID 特征（零往返） */
     STEP_REF,          /* 读 Report Reference（report id + 类型） */
     STEP_MAP,          /* 读 Report Map（拿角色） */
+    STEP_PROTO,        /* 小米：读/写 Protocol Mode = Report */
+    STEP_CP,           /* 小米：订阅前先 Exit Suspend */
     STEP_SUB,          /* 写 CCCD 订阅 */
     STEP_DONE,
 };
@@ -61,6 +64,7 @@ typedef struct br_hid_ctx {
     bool     issued;          /* 本步骤的过程已发起，等回调 */
     int      sub;             /* 处理第几个报告特征 */
     int      peer_idx;        /* 第几台遥控器（遥测用） */
+    uint16_t conn_handle;     /* 链路句柄（取证命令要用） */
     int      sub_ok;          /* CCCD 写成功个数 */
     int      sub_fail;        /* CCCD 写失败个数 */
 
@@ -90,10 +94,36 @@ typedef struct br_hid_ctx {
      */
     uint16_t ka_handle;          /* 电量特征（0x2A19）的值句柄 */
     uint16_t cp_handle;          /* HID 控制点（0x2A4C）的值句柄 */
+    uint8_t  cp_props;           /* HID 控制点支持的写操作 */
     bool     cp_written;         /* 控制点只写一次 */
+    uint16_t pm_handle;          /* Protocol Mode（0x2A4E）的值句柄 */
+    uint8_t  pm_props;
+    uint8_t  pm_value;
+    int16_t  pm_write_status;    /* -1=未写；0..=ATT 状态 */
+    int16_t  cp_status;
     bool     batt_logged;        /* 电量只打一次 */
-    uint16_t cc_last_usage;      /* Chromecast 按键：当前按着的那个键 */
+    uint8_t  cc_last_usage;      /* Chromecast 按键：当前按着的那个键 */
     int64_t  next_ka_us;
+
+    /*
+     * ★ 小米开麦命令 ★
+     *   TV 侧系统蓝牙栈（BleRemoteControllerService$AudioRCGattCallback）
+     *   对 HID 服务的 Report ID 4 写 20 字节：
+     *     [3]=0x80 [4]=0x01 开麦，[4]=0x00 关麦。
+     *   不写这条命令，遥控器只发按键报告、永远不发音频。
+     */
+    uint16_t audio_enable_handle;
+    uint8_t  audio_enable_props;
+    bool     audio_enable_pending;
+    bool     audio_enable_on;
+    int64_t  audio_enable_retry_us;
+    bool     voice_down;         /* 去重：键盘 0x3E / 20 字节控制报告 */
+
+    /*
+     * ★ 允许订阅数据通道 ★
+     *   小米一代的语音音频装在 HID 的大包报告里，默认不订（会顶断链路）。
+     */
+    bool     xiaomi_mode;
 
     br_hidmap_t map;
     br_hid_report_t reports[BR_HID_MAX_REPORTS];
@@ -106,6 +136,10 @@ typedef struct br_hid_ctx {
 /* 表为空时的重试节奏：最多等 BR_HID_TABLE_TRIES × BR_HID_TABLE_RETRY_US */
 #define BR_HID_TABLE_TRIES     20
 #define BR_HID_TABLE_RETRY_US  300000
+
+/* 大包（语音数据流）最多记多少条 / 每条最多打多少字节 */
+#define BR_HID_RAW_LOG_MAX     4
+#define BR_HID_RAW_HEX_MAX     64
 
 /* 链路保活的间隔：必须明显小于 supervision timeout（5 秒） */
 #define BR_HID_KEEPALIVE_US    1000000
@@ -126,6 +160,8 @@ typedef struct br_hid_ctx {
 static br_hid_ctx_t s_ctx[8];
 static br_hid_key_fn s_key_fn;
 static void *s_key_ctx;
+static br_hid_voice_fn s_voice_fn;
+static void *s_voice_ctx;
 static int8_t s_emit_peer_idx = -1;
 
 void br_hid_reset(void)
@@ -155,6 +191,109 @@ void br_hid_set_key_handler(br_hid_key_fn fn, void *ctx)
 {
     s_key_fn = fn;
     s_key_ctx = ctx;
+}
+
+void br_hid_set_voice_handler(br_hid_voice_fn fn, void *ctx)
+{
+    s_voice_fn = fn;
+    s_voice_ctx = ctx;
+}
+
+void br_hid_set_xiaomi(int peer_idx, bool on)
+{
+    if (peer_idx < 0 || peer_idx >= (int)(sizeof(s_ctx) / sizeof(s_ctx[0]))) {
+        return;
+    }
+    s_ctx[peer_idx].xiaomi_mode = on;
+}
+
+/* ------------------------------------------------------------------ 取证
+ *
+ * ★ 读/写任意特征的值 ★
+ *   小米一代的语音音频不来的时候，需要看它那几路 Feature/Output 报告里
+ *   是不是有「开麦」开关 —— 这两条命令就是干这个的。
+ */
+static int probe_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                         struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    uint16_t handle = (uint16_t)(uintptr_t)arg;
+    uint16_t status = error ? error->status : 0;
+    if (status != 0 || !attr || !attr->om) {
+        ESP_LOGW(TAG, "PROBE 读 handle=%u 失败: status=%u", handle, status);
+        return 0;
+    }
+    uint16_t len = OS_MBUF_PKTLEN(attr->om);
+    struct os_mbuf *dup = os_mbuf_pullup(attr->om, len ? len : 1);
+    if (!dup) {
+        ESP_LOGW(TAG, "PROBE 读 handle=%u 失败: pullup 失败", handle);
+        return 0;
+    }
+    const uint8_t *p = OS_MBUF_DATA(dup, uint8_t *);
+    ESP_LOGI(TAG, "PROBE 读 handle=%u len=%u: ", handle, len);
+    for (uint16_t i = 0; i < len && i < 64; i++) {
+        ESP_LOGI(TAG, "%02X ", p[i]);
+    }
+    ESP_LOGI(TAG, "");
+    return 0;
+}
+
+bool br_hid_probe_read(int peer_idx, uint16_t handle)
+{
+    if (peer_idx < 0 || peer_idx >= (int)(sizeof(s_ctx) / sizeof(s_ctx[0]))) {
+        return false;
+    }
+    br_hid_ctx_t *c = &s_ctx[peer_idx];
+    if (!c->used || !c->conn_handle) {
+        return false;
+    }
+    int rc = ble_gattc_read(c->conn_handle, handle, probe_read_cb,
+                            (void *)(uintptr_t)handle);
+    ESP_LOGI(TAG, "PROBE 读 handle=%u rc=%d", handle, rc);
+    return rc == 0;
+}
+
+static int probe_write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    uint16_t handle = (uint16_t)(uintptr_t)arg;
+    uint16_t status = error ? error->status : 0;
+    ESP_LOGI(TAG, "PROBE 写 handle=%u status=%u", handle, status);
+    return 0;
+}
+
+bool br_hid_probe_write(int peer_idx, uint16_t handle,
+                        const uint8_t *data, uint16_t len)
+{
+    if (peer_idx < 0 || peer_idx >= (int)(sizeof(s_ctx) / sizeof(s_ctx[0]))) {
+        return false;
+    }
+    br_hid_ctx_t *c = &s_ctx[peer_idx];
+    if (!c->used || !c->conn_handle || !data || len == 0) {
+        return false;
+    }
+    uint8_t props = 0;
+    for (int i = 0; i < br_ble_peer_char_count(peer_idx); i++) {
+        br_chr_info_t ci;
+        if (br_ble_peer_char_at(peer_idx, i, &ci) && ci.val_handle == handle) {
+            props = ci.props;
+            break;
+        }
+    }
+    bool no_rsp = (props & BLE_GATT_CHR_PROP_WRITE_NO_RSP) != 0 &&
+                  (props & BLE_GATT_CHR_PROP_WRITE) == 0;
+    int rc;
+    if (no_rsp) {
+        rc = ble_gattc_write_no_rsp_flat(c->conn_handle, handle, data, len);
+    } else {
+        rc = ble_gattc_write_flat(c->conn_handle, handle, data, len,
+                                  probe_write_cb, (void *)(uintptr_t)handle);
+    }
+    ESP_LOGI(TAG, "PROBE 写 handle=%u len=%u no_rsp=%u rc=%d",
+             handle, len, no_rsp, rc);
+    return rc == 0;
 }
 
 static void emit_key(uint8_t src, uint16_t usage, bool down)
@@ -309,6 +448,124 @@ static int verify_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     return 0;
 }
 
+static int pm_write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       struct ble_gatt_attr *attr, void *arg);
+
+static int post_map_step(const br_hid_ctx_t *c)
+{
+    if (c->xiaomi_mode) {
+        if (c->pm_handle) {
+            return STEP_PROTO;
+        }
+        if (c->cp_handle) {
+            return STEP_CP;
+        }
+    }
+    return STEP_SUB;
+}
+
+static int post_proto_step(const br_hid_ctx_t *c)
+{
+    return (c->xiaomi_mode && c->cp_handle) ? STEP_CP : STEP_SUB;
+}
+
+static void pm_write_start(br_hid_ctx_t *c)
+{
+    static const uint8_t report_mode[1] = {0x01};
+    bool no_rsp = (c->pm_props & BLE_GATT_CHR_PROP_WRITE_NO_RSP) != 0 &&
+                  (c->pm_props & BLE_GATT_CHR_PROP_WRITE) == 0;
+    if (no_rsp) {
+        int rc = ble_gattc_write_no_rsp_flat(c->conn_handle, c->pm_handle,
+                                             report_mode, sizeof(report_mode));
+        c->pm_write_status = (int16_t)rc;
+        ESP_LOGI(TAG, "Protocol Mode 写 0x01 no_rsp rc=%d", rc);
+        step_next(c, post_proto_step(c));
+        return;
+    }
+    c->issued = true;
+    c->issued_at_us = esp_timer_get_time();
+    int rc = ble_gattc_write_flat(c->conn_handle, c->pm_handle, report_mode,
+                                  sizeof(report_mode), pm_write_cb, c);
+    if (rc != 0) {
+        c->issued = false;
+        c->pm_write_status = (int16_t)rc;
+        step_next(c, post_proto_step(c));
+    }
+}
+
+static int pm_read_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                      struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    br_hid_ctx_t *c = (br_hid_ctx_t *)arg;
+    uint16_t status = error ? error->status : 0;
+    c->issued = false;
+    if (status == 0 && attr && attr->om) {
+        uint16_t len = OS_MBUF_PKTLEN(attr->om);
+        struct os_mbuf *dup = os_mbuf_pullup(attr->om, len ? len : 1);
+        if (dup && len >= 1) {
+            const uint8_t *p = OS_MBUF_DATA(dup, uint8_t *);
+            c->pm_value = p[0];
+        }
+    }
+    ESP_LOGI(TAG, "Protocol Mode 读: status=%u value=%u", status, c->pm_value);
+    pm_write_start(c);
+    return 0;
+}
+
+static int pm_write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                       struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    br_hid_ctx_t *c = (br_hid_ctx_t *)arg;
+    uint16_t status = error ? error->status : 0;
+    c->issued = false;
+    c->pm_write_status = (int16_t)status;
+    ESP_LOGI(TAG, "Protocol Mode 写 0x01: status=%u", status);
+    step_next(c, post_proto_step(c));
+    return 0;
+}
+
+static int cp_pre_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                     struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    br_hid_ctx_t *c = (br_hid_ctx_t *)arg;
+    uint16_t status = error ? error->status : 0;
+    c->issued = false;
+    c->cp_status = (int16_t)status;
+    ESP_LOGI(TAG, "HID Exit Suspend（订阅前）: status=%u", status);
+    step_next(c, STEP_SUB);
+    return 0;
+}
+
+static void cp_pre_start(br_hid_ctx_t *c)
+{
+    static const uint8_t exit_suspend[1] = {0x01};
+    bool no_rsp = (c->cp_props & BLE_GATT_CHR_PROP_WRITE_NO_RSP) != 0 &&
+                  (c->cp_props & BLE_GATT_CHR_PROP_WRITE) == 0;
+    c->cp_written = true;
+    if (no_rsp) {
+        int rc = ble_gattc_write_no_rsp_flat(c->conn_handle, c->cp_handle,
+                                             exit_suspend, sizeof(exit_suspend));
+        c->cp_status = (int16_t)rc;
+        ESP_LOGI(TAG, "HID Exit Suspend（订阅前）no_rsp rc=%d", rc);
+        step_next(c, STEP_SUB);
+        return;
+    }
+    c->issued = true;
+    c->issued_at_us = esp_timer_get_time();
+    int rc = ble_gattc_write_flat(c->conn_handle, c->cp_handle, exit_suspend,
+                                  sizeof(exit_suspend), cp_pre_cb, c);
+    if (rc != 0) {
+        c->issued = false;
+        c->cp_status = (int16_t)rc;
+        step_next(c, STEP_SUB);
+    }
+}
+
 /**
  * 读回调：Report Reference(2 字节) 或 Report Map。
  *
@@ -339,7 +596,7 @@ static int attr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
             c->sub++;
             step_next(c, STEP_REF);
         } else {
-            step_next(c, STEP_SUB);
+            step_next(c, post_map_step(c));
         }
         return 0;
     }
@@ -428,7 +685,7 @@ static int attr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
     c->map_read = true;
     c->issued = false;
-    step_next(c, STEP_SUB);
+    step_next(c, post_map_step(c));
     return 0;
 }
 
@@ -466,10 +723,19 @@ bool br_hid_begin(int peer_idx, uint16_t conn_handle)
     if (peer_idx < 0 || peer_idx >= (int)(sizeof(s_ctx) / sizeof(s_ctx[0]))) {
         return false;
     }
+    /*
+     * xiaomi_mode 是「这台设备是谁」决定的，不是这一轮连接决定的 ——
+     * 重开一轮订阅不能把它清掉（否则小米那台的语音通道就没了）。
+     */
+    bool allow = s_ctx[peer_idx].xiaomi_mode;
     memset(&s_ctx[peer_idx], 0, sizeof(s_ctx[peer_idx]));
+    s_ctx[peer_idx].xiaomi_mode = allow;
     s_ctx[peer_idx].used = true;
     s_ctx[peer_idx].peer_idx = peer_idx;
+    s_ctx[peer_idx].conn_handle = conn_handle;
     s_ctx[peer_idx].step = STEP_TABLE;
+    s_ctx[peer_idx].pm_write_status = -1;
+    s_ctx[peer_idx].cp_status = -1;
     ESP_LOGI(TAG, "开始 HID 订阅");
     hid_ev(&s_ctx[peer_idx], "begin", "conn", conn_handle, NULL, 0, NULL, 0);
     return true;
@@ -502,6 +768,7 @@ static void pull_table(br_hid_ctx_t *c)
             r->val_handle = ci.val_handle;
             r->cccd_handle = ci.cccd_handle;
             r->ref_handle = ci.ref_handle;
+            r->props = ci.props;
             /* ★ 能不能通知，看特征自己的属性 ★ */
             r->notify = (ci.props & 0x10) != 0;
             if (ci.cccd_handle) {
@@ -513,8 +780,14 @@ static void pull_table(br_hid_ctx_t *c)
             /* 电量特征留作链路保活读的对象 */
             c->ka_handle = ci.val_handle;
         } else if (ci.uuid16 == UUID_HID_CP) {
-            /* HID 控制点：有些设备挂起后要主机写 0x02 才会开始发输入报告 */
+            /* HID 控制点：有些设备挂起后要主机写 0x01 才会开始发输入报告 */
             c->cp_handle = ci.val_handle;
+            c->cp_props = ci.props;
+        } else if (ci.uuid16 == UUID_PROTOCOL_MODE) {
+            c->pm_handle = ci.val_handle;
+            c->pm_props = ci.props;
+            ESP_LOGI(TAG, "Protocol Mode handle=%u props=0x%02x",
+                     ci.val_handle, ci.props);
         } else if ((ci.props & 0x10) && ci.cccd_handle &&
                    c->report_count < BR_HID_MAX_REPORTS) {
             /*
@@ -532,6 +805,7 @@ static void pull_table(br_hid_ctx_t *c)
             r->val_handle = ci.val_handle;
             r->cccd_handle = ci.cccd_handle;
             r->ref_handle = ci.ref_handle;
+            r->props = ci.props;
             r->notify = true;
             r->other = true;
             ESP_LOGI(TAG, "额外订阅候选: uuid=0x%04X handle=%u cccd=%u",
@@ -593,6 +867,94 @@ static void pull_table(br_hid_ctx_t *c)
     step_next(c, STEP_REF);
 }
 
+/*
+ * ★ 找小米的开麦控制报告 ★
+ *
+ * TV 侧系统蓝牙栈按 HID 服务里的 Report 序号取 instance 3。真机报告表：
+ *   rid=1 键盘, rid=2 输出, rid=3 输入, rid=4 控制（可写、不通知）。
+ * 正常路径按 Report Reference 的 rid=4 找；描述符没读到时，
+ * 退化成「第 4 条 0x2A4D」——和 TV 的 instance 3 同一条。
+ */
+static void pick_audio_enable(br_hid_ctx_t *c)
+{
+    if (!c->xiaomi_mode || c->audio_enable_handle) {
+        return;
+    }
+    const uint8_t wr = BLE_GATT_CHR_PROP_WRITE |
+                       BLE_GATT_CHR_PROP_WRITE_NO_RSP;
+    br_hid_report_t *fallback = NULL;
+    int report_no = 0;
+
+    for (int i = 0; i < c->report_count; i++) {
+        br_hid_report_t *r = &c->reports[i];
+        if (r->other) {
+            continue;
+        }
+        if (report_no == 3) {
+            fallback = r;
+        }
+        report_no++;
+        if (r->report_id == 4 && (r->props & wr)) {
+            c->audio_enable_handle = r->val_handle;
+            c->audio_enable_props = r->props;
+            break;
+        }
+    }
+    if (!c->audio_enable_handle && fallback && (fallback->props & wr)) {
+        c->audio_enable_handle = fallback->val_handle;
+        c->audio_enable_props = fallback->props;
+    }
+    if (c->audio_enable_handle) {
+        ESP_LOGI(TAG, "小米开麦控制 handle=%u props=0x%02X",
+                 c->audio_enable_handle, c->audio_enable_props);
+        hid_ev(c, "au_ctrl", "handle", c->audio_enable_handle,
+               "props", c->audio_enable_props, NULL, 0);
+    } else {
+        ESP_LOGW(TAG, "没找到可写的小米开麦控制报告");
+    }
+}
+
+/**
+ * 语音键按下/松开（键盘 0x3E 与 20 字节控制报告都会调，这里去重）。
+ * 同时安排写开麦/关麦命令；真正的写由 br_hid_drive 在空闲时发起。
+ */
+static void xiaomi_voice_event(br_hid_ctx_t *c, bool down)
+{
+    if (c->voice_down == down) {
+        return;
+    }
+    c->voice_down = down;
+    c->audio_enable_on = down;
+    c->audio_enable_pending = true;
+    c->audio_enable_retry_us = 0;
+    ESP_LOGI(TAG, "小米语音键 %s", down ? "按下" : "松开");
+    hid_ev(c, "voice", "down", down ? 1 : 0, NULL, 0, NULL, 0);
+    if (s_voice_fn) {
+        s_voice_fn(c->peer_idx, down, s_voice_ctx);
+    }
+}
+
+static int audio_enable_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                           struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    br_hid_ctx_t *c = (br_hid_ctx_t *)arg;
+    uint16_t status = error ? error->status : 0;
+    c->issued = false;
+    if (status != 0) {
+        c->audio_enable_pending = true;
+        c->audio_enable_retry_us = esp_timer_get_time() + 200000;
+        ESP_LOGW(TAG, "小米开麦命令写失败: status=%u", status);
+        hid_ev(c, "au_err", "status", status, NULL, 0, NULL, 0);
+        return 0;
+    }
+    ESP_LOGI(TAG, "小米开麦命令已发: %s",
+             c->audio_enable_on ? "开" : "关");
+    hid_ev(c, "au_ok", "on", c->audio_enable_on ? 1 : 0, NULL, 0, NULL, 0);
+    return 0;
+}
+
 void br_hid_drive(int peer_idx, uint16_t conn_handle)
 {
     if (peer_idx < 0 || peer_idx >= (int)(sizeof(s_ctx) / sizeof(s_ctx[0]))) {
@@ -621,6 +983,10 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
                 step_next(c, STEP_REF);
             } else if (c->step == STEP_MAP) {
                 c->sub = 0;
+                step_next(c, STEP_SUB);
+            } else if (c->step == STEP_PROTO) {
+                step_next(c, post_proto_step(c));
+            } else if (c->step == STEP_CP) {
                 step_next(c, STEP_SUB);
             } else if (c->step == STEP_SUB) {
                 c->sub++;
@@ -677,6 +1043,19 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
         break;
     }
 
+    case STEP_PROTO: {
+        c->pending_attr = c->pm_handle;
+        c->issued = true;
+        c->issued_at_us = esp_timer_get_time();
+        rc = ble_gattc_read(conn_handle, c->pm_handle, pm_read_cb, c);
+        break;
+    }
+
+    case STEP_CP: {
+        cp_pre_start(c);
+        return;
+    }
+
     case STEP_SUB: {
         if (c->sub >= c->report_count) {
             step_next(c, STEP_DONE);
@@ -689,6 +1068,11 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
                 ESP_LOGI(TAG, "  report[%d] val=%u cccd=%u ref=%u notify=%d sub=%d",
                          i, r->val_handle, r->cccd_handle, r->ref_handle,
                          r->notify ? 1 : 0, r->subscribed ? 1 : 0);
+            }
+            if (c->xiaomi_mode) {
+                hid_ev(c, "init", "proto_val", c->pm_value,
+                       "pm_status", c->pm_write_status,
+                       "cp_status", c->cp_status);
             }
             hid_ev(c, "done", "reports", c->report_count,
                    "ok", c->sub_ok, NULL, 0);
@@ -715,7 +1099,13 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
          *   读不到（type 仍是 0）就照订 —— 多订一条最多多点噪声，
          *   少订一条就是那个键永远学不到。
          */
-        if (r->report_type != 0 && r->report_type != 1) {
+        if (r->report_type != 0 && r->report_type != 1 && !c->xiaomi_mode) {
+            /*
+             * ★ 例外：小米一代 ★
+             *   它有一批特征：属性带 notify，Report Reference 却报 type=3
+             *   （Feature）。按规范 Feature 报告不会通知 —— 但小米就用它们
+             *   传语音音频。所以对小米这台不按 type 筛：带 notify + 有 CCCD 就订。
+             */
             hid_ev(c, "not_input", "id", r->report_id, "type",
                    r->report_type, NULL, 0);
             c->sub++;
@@ -725,8 +1115,10 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
          * ★ 数据通道不订 ★
          *   Map 里认出来的 DATA 角色（遥控器的语音/大数据通道）
          *   订了会把链路顶断（CMCC v3 实测），按键报告也就跟着上不来。
+         *   ★ 例外：小米一代的语音音频就装在数据通道报告里 ★
+         *     那台必须订（br_hid_set_xiaomi 只对小米放开）。
          */
-        if (r->role == BR_ROLE_DATA) {
+        if (r->role == BR_ROLE_DATA && !c->xiaomi_mode) {
             ESP_LOGI(TAG, "  report id=0x%02X 是数据通道，不订阅",
                      r->report_id);
             hid_ev(c, "skip_data", "id", r->report_id, NULL, 0, NULL, 0);
@@ -760,7 +1152,56 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
 
     case STEP_DONE: {
         /*
-         * ★ HID 控制点：写一次 0x02（Exit Suspend）★
+         * ★ 小米开麦/关麦 ★
+         *   TV 侧对 Report ID 4（HID 服务 instance 3）写 20 字节：
+         *     00 00 00 80 01 00…  开麦
+         *     00 00 00 80 00 00…  关麦
+         *   这里在语音键状态变化后，等 GATT 空闲时补发。
+         */
+        pick_audio_enable(c);
+        if (c->audio_enable_pending && !c->audio_enable_handle) {
+            c->audio_enable_pending = false;
+        }
+        if (c->audio_enable_pending && c->audio_enable_handle) {
+            int64_t now = esp_timer_get_time();
+            if (now >= c->audio_enable_retry_us) {
+                uint8_t pkt[20] = {0};
+                pkt[3] = 0x80;
+                pkt[4] = c->audio_enable_on ? 0x01 : 0x00;
+                bool no_rsp =
+                    (c->audio_enable_props & BLE_GATT_CHR_PROP_WRITE_NO_RSP) != 0 &&
+                    (c->audio_enable_props & BLE_GATT_CHR_PROP_WRITE) == 0;
+                int arc;
+                if (no_rsp) {
+                    arc = ble_gattc_write_no_rsp_flat(conn_handle,
+                                                      c->audio_enable_handle,
+                                                      pkt, sizeof(pkt));
+                    c->issued = false;
+                } else {
+                    c->issued = true;
+                    c->issued_at_us = now;
+                    arc = ble_gattc_write_flat(conn_handle,
+                                               c->audio_enable_handle,
+                                               pkt, sizeof(pkt),
+                                               audio_enable_cb, c);
+                }
+                if (arc == 0) {
+                    c->audio_enable_pending = false;
+                    if (no_rsp) {
+                        ESP_LOGI(TAG, "小米开麦命令已发(no_rsp): %s",
+                                 c->audio_enable_on ? "开" : "关");
+                    }
+                } else {
+                    c->issued = false;
+                    c->audio_enable_retry_us = now + 200000;
+                }
+                return;
+            }
+            return;
+        }
+
+        /*
+         * ★ HID 控制点：写一次 0x01（Exit Suspend）★
          *
          * 有些 HID 设备（尤其是 Google 系的）上电是「挂起」状态，
          * 主机不告诉它「我在线」，它就不发输入报告。
@@ -768,15 +1209,24 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
          */
         if (!c->cp_written && c->cp_handle) {
             c->cp_written = true;
-            static const uint8_t exit_suspend[1] = {0x02};
-            c->issued = true;
-            c->issued_at_us = esp_timer_get_time();
-            int crc = ble_gattc_write_flat(conn_handle, c->cp_handle,
+            static const uint8_t exit_suspend[1] = {0x01};
+            bool no_rsp = (c->cp_props & BLE_GATT_CHR_PROP_WRITE_NO_RSP) != 0 &&
+                          (c->cp_props & BLE_GATT_CHR_PROP_WRITE) == 0;
+            int crc;
+            if (no_rsp) {
+                crc = ble_gattc_write_no_rsp_flat(conn_handle, c->cp_handle,
+                                                   exit_suspend, sizeof(exit_suspend));
+                c->issued = false;
+            } else {
+                c->issued = true;
+                c->issued_at_us = esp_timer_get_time();
+                crc = ble_gattc_write_flat(conn_handle, c->cp_handle,
                                            exit_suspend, sizeof(exit_suspend),
                                            cp_cb, c);
+            }
             if (crc != 0) {
                 c->issued = false;
-                ESP_LOGW(TAG, "写 HID 控制点失败: %d", crc);
+                ESP_LOGW(TAG, "写 HID 控制点失败(no_rsp=%u): %d", no_rsp, crc);
             }
             return;
         }
@@ -866,7 +1316,11 @@ void br_hid_drive(int peer_idx, uint16_t conn_handle)
             step_next(c, STEP_REF);
         } else if (c->step == STEP_MAP) {
             c->sub = 0;
-            step_next(c, STEP_SUB); /* 映射读不到也照样订阅 */
+            step_next(c, post_map_step(c)); /* 映射读不到也照样初始化/订阅 */
+        } else if (c->step == STEP_PROTO) {
+            pm_write_start(c);
+        } else if (c->step == STEP_CP) {
+            step_next(c, STEP_SUB);
         } else {
             step_next(c, STEP_DONE);
         }
@@ -943,9 +1397,20 @@ static void parse_keyboard(br_hid_report_t *r, const uint8_t *data, uint16_t len
         }
     }
 
-    for (int i = 0; i < 6 && (size_t)(i + 2) < len; i++) {
-        uint8_t cur = kbd[i + 1];
-        uint8_t prev = r->last[i + 1];
+    /*
+     * ★ 键码从哪一字节开始 ★
+     *
+     *   标准键盘报告 = [修饰键][保留][键码×6] → 键码从第 2 字节开始
+     *   7 字节的变体  = [修饰键][键码×6]      → 键码从第 1 字节开始
+     *
+     * 之前一律从第 1 字节读 —— 对小米那台（键码在第 2 字节）虽然取值碰巧对，
+     * 但第 1 个「保留字节」一旦非 0 就会变成一个假按键，
+     * 第 7 字节的键码也会漏掉。
+     */
+    int base = (len >= 8) ? 2 : 1;
+    for (int i = 0; i < 6 && (size_t)(i + base) < len; i++) {
+        uint8_t cur = kbd[i + base];
+        uint8_t prev = r->last[i + base];
         if (cur != prev) {
             if (prev) {
                 emit_key(BR_HID_SRC_KEYBOARD, prev, false);
@@ -1041,14 +1506,106 @@ void br_hid_on_notify(int peer_idx, uint16_t attr_handle,
             n = sizeof(r->last);
         }
 
-        br_kv_t raw;
-        br_kv_init(&raw);
-        br_kv_add_int(&raw, "idx", peer_idx);
-        br_kv_add_int(&raw, "handle", attr_handle);
-        br_kv_add_int(&raw, "n", len);
-        br_kv_add_hex(&raw, "hex", data, len);
-        br_proto_send_ev("HIDRAW", &raw);
+        /*
+         * ★ 小米语音键的主判据 ★
+         *   TV 侧系统蓝牙栈看 Report ID 1 的键盘报告：
+         *     按下 value[2]==0x3E；松开 value[2]==0 && value[0]==0。
+         *   20 字节控制报告也会报同一件事，统一走 xiaomi_voice_event 去重。
+         */
+        if (c->xiaomi_mode && r->report_id == 1 && n >= 3) {
+            if (data[2] == 0x3E) {
+                xiaomi_voice_event(c, true);
+                return;
+            }
+            if (data[2] == 0 && data[0] == 0 && c->voice_down) {
+                xiaomi_voice_event(c, false);
+                return;
+            }
+        }
+
+        /*
+         * ★ 大包 = 语音音频一类的高频数据流 ★
+         *
+         * 小米一代的语音就装在 60 字节的 HID 报告里，133 帧/秒。
+         * 这种包绝不能按「按键位图」去解（480 个位会炸出 480 个假按键事件），
+         * 也不能每帧都往协议行里灌（USB CDC 会被刷爆）。
+         *
+         * 判据：**长 + 不是按键类角色**。
+         *   键盘/消费者/手柄角色哪怕长也要照常解（手柄报告本来就长）。
+         *
+         * 做法：只把前若干条原样打到串口日志里（取证用），
+         * 协议侧的 HIDRAW 同样只发前若干条。
+         */
+        bool raw_stream = (len > 16) &&
+                          (r->role == BR_ROLE_VENDOR || r->role == BR_ROLE_DATA ||
+                           r->role == BR_ROLE_NONE || r->role == BR_ROLE_GENERIC);
+        if (raw_stream) {
+            r->raw_total++;
+            if (r->raw_logged < BR_HID_RAW_LOG_MAX) {
+                r->raw_logged++;
+                char hx[BR_HID_RAW_HEX_MAX * 2 + 1];
+                uint16_t hl = (len > BR_HID_RAW_HEX_MAX) ? BR_HID_RAW_HEX_MAX : len;
+                for (uint16_t k = 0; k < hl; k++) {
+                    snprintf(&hx[k * 2], 3, "%02X", data[k]);
+                }
+                hx[hl * 2] = '\0';
+                ESP_LOGI(TAG,
+                         "RAW h=%u b0=%02X role=%u len=%u: %s",
+                         attr_handle, data[0], r->role, len, hx);
+            } else if ((r->raw_total % 100) == 0) {
+                ESP_LOGI(TAG, "RAW h=%u 已收到 %d 包（只记前 %d 包）",
+                         attr_handle, r->raw_total, BR_HID_RAW_LOG_MAX);
+            }
+        }
+
+        /*
+         * ★ 只把前 N 条大包发给协议侧 ★
+         *   raw_logged 到上限后不再增长；以前用 <= 判断会变成
+         *   「24 之后每一帧都发」，133 帧/秒 × 3 条通道把 USB CDC 拖死，
+         *   主机任务堵在串口上，最终 ACL 缓冲耗尽（ACL buf alloc failed）。
+         */
+        if (!raw_stream || r->raw_total <= BR_HID_RAW_LOG_MAX) {
+            br_kv_t raw;
+            br_kv_init(&raw);
+            br_kv_add_int(&raw, "idx", peer_idx);
+            br_kv_add_int(&raw, "handle", attr_handle);
+            br_kv_add_int(&raw, "n", len);
+            br_kv_add_hex(&raw, "hex", data, len);
+            br_proto_send_ev("HIDRAW", &raw);
+        }
         if (n == 0) {
+            return;
+        }
+
+        /*
+         * 小米语音键的 20 字节控制报告也是 Feature：先在 HIDRAW 之后识别，
+         * 再让下面的非 Input 守卫原样保存并返回。只按报告元数据识别，
+         * 不依赖某个连接的 ATT 句柄，也不把控制报告伪装成 ATVV。
+         */
+        /*
+         * 20 字节控制包：byte0=01/00，其余全 0。
+         * 必须校验“其余全 0”，否则其它 20 字节 Feature 数据
+         * 会被误报成语音按下/松开。
+         */
+        if (c->xiaomi_mode && r->report_type != 1 &&
+            len == 20 && data && data[0] <= 1) {
+            bool ctrl20 = true;
+            for (uint16_t k = 1; k < len; k++) {
+                if (data[k] != 0) {
+                    ctrl20 = false;
+                    break;
+                }
+            }
+            if (ctrl20) {
+                xiaomi_voice_event(c, data[0] == 1);
+            }
+        }
+
+        /* 小米的语音控制/音频是 Feature 报告，首字节不能当键盘修饰键。 */
+        if (c->xiaomi_mode && r->report_type != 1) {
+            memcpy(r->last, data,
+                   (len > sizeof(r->last)) ? sizeof(r->last) : len);
+            r->has_last = true;
             return;
         }
 
@@ -1083,6 +1640,11 @@ void br_hid_on_notify(int peer_idx, uint16_t attr_handle,
          * 按标准键盘报告去解会整体错位一格。
          * 判据：长度 8 且第 2~8 字节全 0（标准键盘报告的第 2 字节是键码，
          * 按键时必然非 0，所以不会误判）。
+         *
+         * ★ 小米那台不能走这条分支 ★
+         *   小米的按键也是 8 字节标准键盘报告（[修饰][保留][键码×6]），
+         *   松手时的全 0 包同样「后七字节全 0」——
+         *   走进这条分支，抬起事件就被吞了（灯一直常亮、手势也判不出来）。
          */
         bool tail_zero = true;
         for (uint16_t k = 1; k < n; k++) {
@@ -1091,7 +1653,7 @@ void br_hid_on_notify(int peer_idx, uint16_t attr_handle,
                 break;
             }
         }
-        if (n == 8 && tail_zero) {
+        if (n == 8 && tail_zero && !c->xiaomi_mode) {
             uint8_t code = data[0];
             if (code == 0) {
                 /* 松开：8 字节全零 */
@@ -1116,6 +1678,20 @@ void br_hid_on_notify(int peer_idx, uint16_t attr_handle,
                 }
             }
             memcpy(r->last, data, n);
+            r->has_last = true;
+            return;
+        }
+
+        /*
+         * ★ 数据流不进按键解码 ★
+         *
+         * 语音音频那种长包按位图解，会把每个比特的变化都当成一次按键 ——
+         * 一帧 60 字节就是 480 个假事件，直接把协议行和手势引擎打爆。
+         * 这里只留日志（上面已经打过），不产生任何按键事件。
+         */
+        if (raw_stream) {
+            memcpy(r->last, data,
+                   (len > sizeof(r->last)) ? sizeof(r->last) : len);
             r->has_last = true;
             return;
         }
